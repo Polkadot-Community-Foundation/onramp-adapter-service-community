@@ -1,0 +1,196 @@
+name: Production image
+
+# Builds the onramp image for production from a PCF release tag on the `production` branch and
+# pushes it to the production registry, tagged with that release tag. It does not deploy.
+#
+# `release.yml` keeps publishing development images from `main` to GHCR; this workflow is the only
+# path to the production registry. The push job runs in the `production` GitHub environment, which
+# requires a reviewer, and its credentials are keyless (GitHub OIDC -> Workload Identity
+# Federation) and only issued to that environment. Registry and identity come from production
+# environment variables, so a missing value fails the run. Registry tags are immutable: a release
+# tag is built once.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag on the production branch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-image-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: tag
+        name: Require a tag on the production branch
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9A-Za-z._-]{1,127}$'; then
+            echo "::error::Refusing tag $(printf '%q' "$TAG"): not a release tag."
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
+            echo "::error::${TAG} is not a tag in this repository"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "refs/tags/${TAG}^{commit}" origin/production; then
+            echo "::error::${TAG} is not on the production branch"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  # The release gate from release.yml, run against the tag's source.
+  verify:
+    needs: release-tag
+    name: Verify (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The same Postgres `ci.yml` gives its test jobs. Without it this gate failed every run from
+    # the CloudSQL migration until this block landed: `npm run verify` and `npm run test:e2e`
+    # both need a database, and nothing was published in between. The gate that says "the artefact
+    # about to be published works" was the one artefact nobody was watching.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: onramp-test
+          POSTGRES_DB: onramp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ONRAMP_TEST_PG: postgres://postgres:onramp-test@localhost:5432/onramp_test
+    steps:
+      # Same SHA pins as ci.yml: a tag is mutable, so `@v4` is a third party able to change
+      # what runs in the workflow that deploys to production.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release-tag.outputs.tag }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+      # `check:chart` schema-validates the rendered manifests offline; without the binary the
+      # gate silently degrades to "does it render".
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: 0.8.0
+        run: |
+          set -euo pipefail
+          base="https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}"
+          archive="kubeconform-linux-amd64.tar.gz"
+
+          curl -sSfL -o "$archive" "$base/$archive"
+          curl -sSfL -o CHECKSUMS "$base/CHECKSUMS"
+
+          # The version pin only binds a filename; verifying the published checksum binds the
+          # bytes, so a replaced release asset cannot change the gate silently.
+          grep " ${archive}\$" CHECKSUMS | sha256sum -c -
+
+          sudo tar -xzf "$archive" -C /usr/local/bin kubeconform
+          kubeconform -v
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run test:e2e
+      - run: npm run check:chart
+
+  push:
+    needs: [release-tag, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_REPO: ${{ vars.IMAGE_REGISTRY }}/onramp-adapter-service
+      IMAGE_TAG: ${{ needs.release-tag.outputs.tag }}
+    steps:
+      - name: Require production configuration
+        env:
+          IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          missing=0
+          for name in IMAGE_REGISTRY GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not set in the production environment"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.release-tag.outputs.tag }}
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - run: gcloud auth configure-docker "${IMAGE_REPO%%/*}" --quiet
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # See reusable-build-images.yml: buildx only reads the Actions cache through these.
+      - name: Expose the Actions cache to buildx
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Bake and push
+        run: |
+          set -euo pipefail
+          docker buildx bake app \
+            --file docker-bake.hcl \
+            --set "app.tags=$IMAGE_REPO:$IMAGE_TAG" \
+            --set "app.args.VCS_REF=$(git rev-parse HEAD)" \
+            --set "app.args.BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set "*.attest=type=sbom" \
+            --set "*.attest=type=provenance,mode=max" \
+            --set "*.cache-from=type=gha,scope=production" \
+            --set "*.cache-to=type=gha,scope=production,mode=max,ignore-error=true" \
+            --push
+
+      - name: Summary
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE_REPO:$IMAGE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          {
+            echo "## Pushed"
+            echo
+            echo '```'
+            echo "$IMAGE_REPO:$IMAGE_TAG"
+            echo "$IMAGE_REPO@$digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
