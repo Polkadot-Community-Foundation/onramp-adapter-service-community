@@ -1,0 +1,163 @@
+name: Devnet image
+
+# Builds the onramp image from the `devnet` branch and pushes it to the devnet registry, tagged
+# `YYYYmmdd-HHMMSS-<sha8>`. It does not deploy. Tags are immutable: no moving tag is published.
+#
+# The push job runs in the `devnet` GitHub environment. Credentials are keyless (GitHub OIDC ->
+# Workload Identity Federation) and registry and identity come from devnet environment variables,
+# so a missing value fails the run. `release.yml` only runs on `main` and is unaffected.
+
+on:
+  push:
+    branches: [devnet]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devnet-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # `workflow_dispatch` accepts any ref; only `devnet` publishes.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the devnet branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != "refs/heads/devnet" ]; then
+            echo "::error::devnet-image.yml only publishes from refs/heads/devnet (ref was $REF)"
+            exit 1
+          fi
+
+  # The release gate from release.yml.
+  verify:
+    needs: guard
+    name: Verify (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: onramp-test
+          POSTGRES_DB: onramp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ONRAMP_TEST_PG: postgres://postgres:onramp-test@localhost:5432/onramp_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.2
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: 0.8.0
+        run: |
+          set -euo pipefail
+          base="https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}"
+          archive="kubeconform-linux-amd64.tar.gz"
+
+          curl -sSfL -o "$archive" "$base/$archive"
+          curl -sSfL -o CHECKSUMS "$base/CHECKSUMS"
+          grep " ${archive}\$" CHECKSUMS | sha256sum -c -
+
+          sudo tar -xzf "$archive" -C /usr/local/bin kubeconform
+          kubeconform -v
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run test:e2e
+      - run: npm run check:chart
+
+  push:
+    needs: [guard, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: devnet
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_REPO: ${{ vars.IMAGE_REGISTRY }}/onramp-adapter-service
+    steps:
+      - name: Require devnet configuration
+        env:
+          IMAGE_REGISTRY: ${{ vars.IMAGE_REGISTRY }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          missing=0
+          for name in IMAGE_REGISTRY GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not set in the devnet environment"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Image tag
+        run: echo "IMAGE_TAG=$(date -u '+%Y%m%d-%H%M%S')-${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - run: gcloud auth configure-docker "${IMAGE_REPO%%/*}" --quiet
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # See reusable-build-images.yml: buildx only reads the Actions cache through these.
+      - name: Expose the Actions cache to buildx
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Bake and push
+        run: |
+          set -euo pipefail
+          docker buildx bake app \
+            --file docker-bake.hcl \
+            --set "app.tags=$IMAGE_REPO:$IMAGE_TAG" \
+            --set "app.args.VCS_REF=$(git rev-parse HEAD)" \
+            --set "app.args.BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set "*.attest=type=sbom" \
+            --set "*.attest=type=provenance,mode=max" \
+            --set "*.cache-from=type=gha,scope=devnet" \
+            --set "*.cache-to=type=gha,scope=devnet,mode=max,ignore-error=true" \
+            --push
+
+      - name: Summary
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE_REPO:$IMAGE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          {
+            echo "## Pushed"
+            echo
+            echo '```'
+            echo "$IMAGE_REPO:$IMAGE_TAG"
+            echo "$IMAGE_REPO@$digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
