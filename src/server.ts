@@ -298,20 +298,20 @@ export async function buildServer(
     asCaller,
     async (request, reply) => {
       const q = parse(supportedCountriesQuery, request.query);
-      return reply.send({ countries: await onramp.supportedCountries(q.destinationCurrencyCode) });
+      return reply.send({ countries: await onramp.supportedCountries(q.destinationCurrencyCode, q.direction) });
     },
   );
   app.get<{ Querystring: Record<string, string> }>('/supported', asCaller, async (request, reply) => {
     const q = parse(supportedQuery, request.query);
     // Projected, not forwarded: `providers` is aggregation bookkeeping no client reads, and
     // serialising it would name Meld's sub-providers on a surface that deliberately never does.
-    return reply.send(toCorridorDto(await onramp.supported(q.country, q.destinationCurrencyCode)));
+    return reply.send(toCorridorDto(await onramp.supported(q.country, q.destinationCurrencyCode, q.direction)));
   });
 
   // Every supported corridor for a crypto in one payload, read from the DB the refresh fills (off Meld).
   app.get<{ Querystring: Record<string, string> }>('/supported/corridors', asCaller, async (request, reply) => {
     const q = parse(supportedCorridorsQuery, request.query);
-    return reply.send({ corridors: await onramp.supportedCorridors(q.destinationCurrencyCode) });
+    return reply.send({ corridors: await onramp.supportedCorridors(q.destinationCurrencyCode, q.direction) });
   });
 
   /** The one operation that leads to a card charge. */
@@ -449,22 +449,28 @@ export async function buildServer(
    * app. It carries no status and needs no auth. The buyer's browser lands here with no header,
    * and the authoritative settlement is still the app's own status poll.
    */
-  app.get('/meld/return', async (_request, reply) =>
-    reply.type('text/html').send(
+  app.get('/meld/return', async (request, reply) => {
+    // A sale lands here after KYC, not after a payment: nothing has been paid yet, and the app
+    // sends the funds once it reads the provider's deposit address. `?flow=sell` says so; the
+    // buy's page is unchanged.
+    const sell = (request.query as { flow?: unknown } | undefined)?.flow === 'sell';
+    const title = sell ? 'Verification complete' : 'Payment received';
+    const message = sell ? 'meld:verified' : 'meld:paid';
+    return reply.type('text/html').send(
       `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
         `<meta name="viewport" content="width=device-width, initial-scale=1">` +
-        `<title>Payment received</title></head>` +
+        `<title>${title}</title></head>` +
         `<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;` +
         `font-family:system-ui,sans-serif;background:#0b0b0b;color:#fff">` +
         `<div style="text-align:center">` +
         `<div style="width:34px;height:34px;margin:0 auto 14px;border:3px solid #333;border-top-color:#fff;` +
         `border-radius:50%;animation:s 1s linear infinite"></div>` +
-        `<p style="font-size:14px;color:#bbb">Payment received, returning...</p></div>` +
+        `<p style="font-size:14px;color:#bbb">${title}, returning...</p></div>` +
         `<style>@keyframes s{to{transform:rotate(360deg)}}</style>` +
-        `<script>try{window.parent.postMessage({type:"meld:paid"},"*")}catch(e){}</script>` +
+        `<script>try{window.parent.postMessage({type:"${message}"},"*")}catch(e){}</script>` +
         `</body></html>`,
-    ),
-  );
+    );
+  });
 
   /**
    * A route that does not exist still owes the caller the contract body.
