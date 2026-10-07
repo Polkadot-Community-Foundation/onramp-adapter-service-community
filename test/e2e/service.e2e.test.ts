@@ -23,7 +23,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { mintChallenge } from '../../src/personhood/challenge.js';
 import { mintToken } from '../../src/personhood/token.js';
-import { createSchema, dropOwnSchemas, liveBackends, storeConfigFor, storePassword } from '../pg.js';
+import { createSchema, dropOwnSchemas, liveBackends, rawQuery, storeConfigFor, storePassword } from '../pg.js';
 
 /** What `spawn` with piped stdout/stderr and no stdin actually returns. */
 type Spawned = ChildProcessByStdio<null, Readable, Readable>;
@@ -67,6 +67,24 @@ let started = false;
 /** Every authenticated path the fake Meld was asked for, in order. */
 let meldCalls: string[] = [];
 
+/**
+ * The asset codes this deployment delivers, as Meld would classify them.
+ *
+ * The fake needs to tell a crypto code from a fiat one because that, and nothing else, is how
+ * Meld decides which direction a quote or a session is (verified). A list rather than a pattern:
+ * `DOT` and `BTC` are three letters, so no shape test separates them from `USD`.
+ */
+const CRYPTO_CODES = ['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB'];
+const isCrypto = (code: unknown): boolean => typeof code === 'string' && CRYPTO_CODES.includes(code);
+
+/** The request body as JSON, or an empty object for a GET. */
+async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const text = Buffer.concat(chunks).toString('utf8');
+  return text === '' ? {} : (JSON.parse(text) as Record<string, unknown>);
+}
+
 /** A Meld that answers the boot probe, a quote, and a session creation. */
 async function fakeMeld(
   opts: { failQuote?: boolean; failBoot?: boolean; transactionStatus?: string } = {},
@@ -80,7 +98,9 @@ async function fakeMeld(
     // The fake enforces the parts of Meld's contract the client is responsible for. Accepting
     // any shape made this suite blind to exactly the regressions it should catch: swapping
     // `BASIC` for `Bearer`, dropping the version header, or using the wrong verb all passed.
-    if (req.headers.authorization !== `BASIC ${MELD_KEY}`) {
+    // The country catalog is the one call the service makes unkeyed (`publicGet`), as Meld allows.
+    const unkeyed = req.url?.startsWith('/network-partner/supported/countries') === true;
+    if (!unkeyed && req.headers.authorization !== `BASIC ${MELD_KEY}`) {
       json({ code: 'UNAUTHORIZED' }, 401);
       return;
     }
@@ -91,7 +111,9 @@ async function fakeMeld(
     // The settlement worker's transaction search is the one GET the client makes; everything
     // else is a POST and a wrong verb should still be refused.
     const searching = req.url?.startsWith('/payments/transactions') === true;
-    if (req.method !== (searching ? 'GET' : 'POST')) {
+    // Discovery is the other family of GETs: countries, defaults, routes.
+    const discovering = req.url?.startsWith('/network-partner/') === true;
+    if (req.method !== (searching || discovering ? 'GET' : 'POST')) {
       json({ code: 'BAD_METHOD' }, 405);
       return;
     }
@@ -125,40 +147,159 @@ async function fakeMeld(
       );
       return;
     }
-    if (req.url?.startsWith('/payments/crypto/quote')) {
-      // The boot probe uses this path too, so failing it only after boot keeps the service up.
-      if (opts.failBoot && !started) {
-        json({ code: 'BAD_CREDENTIAL' }, 401);
+    if (discovering) {
+      // `NF` has no default fiat (catalog pass drops it); `ZZ` has a fiat but no route (routes
+      // pass skips it without writing a row).
+      if (req.url?.startsWith('/network-partner/supported/countries')) {
+        json({
+          countries: [
+            { countryCode: 'US', name: 'United States' },
+            { countryCode: 'BR', name: 'Brazil' },
+            { countryCode: 'NF', name: 'Nofiat' },
+            { countryCode: 'ZZ', name: 'Routeless' },
+          ],
+        });
         return;
       }
-      if (opts.failQuote && started) {
-        json({ code: 'UPSTREAM_BOOM' }, 500);
+      // The real endpoint answers `404` for every country under `CRYPTO_OFFRAMP` (verified); a
+      // sell's `defaultFiat` does not call this path at all (see `fiat-limits` below), so the
+      // only caller that is *supposed* to reach this branch is a buy. Modelled here, not just
+      // asserted in the unit suite, because a regression that routed a sell's `defaultFiat` back
+      // through this endpoint would otherwise pass silently: `US`/`BR` resolve to the same
+      // currency codes on both this handler and `fiat-limits` below, so nothing here would have
+      // told the two apart.
+      if (req.url?.startsWith('/network-partner/defaults/')) {
+        const [, , , rawCountry, category] = req.url.split('/');
+        const country = rawCountry ?? '';
+        if (category === 'CRYPTO_OFFRAMP') {
+          json({ code: 'NOT_FOUND', message: `No defaults are configured for country ${country} and category CRYPTO_OFFRAMP` }, 404);
+          return;
+        }
+        const currencyCode = { US: 'USD', BR: 'BRL', ZZ: 'ZZZ' }[country];
+        json(currencyCode === undefined ? { countryCode: country } : { countryCode: country, currencyCode });
         return;
       }
-      json({
-        quotes: [
-          {
-            serviceProvider: 'TRANSAK',
-            sourceAmount: '25.00',
-            sourceCurrencyCode: 'USD',
-            destinationAmount: '24',
-            destinationCurrencyCode: 'USDC_ASSETHUB',
-            totalFee: '1.00',
-          },
-        ],
-      });
+      // A sell's substitute for `defaults`, which does not exist for `CRYPTO_OFFRAMP` (see above):
+      // `MeldDiscovery.defaultFiat` reads a country's fiat off this catalog instead. `GB` is here
+      // for the sell test below; the rest mirror the on-ramp defaults for symmetry.
+      if (req.url?.startsWith('/network-partner/supported/fiat-limits')) {
+        json({
+          fiatLimits: [
+            { countryCode: 'US', currencyCode: 'USD' },
+            { countryCode: 'BR', currencyCode: 'BRL' },
+            { countryCode: 'ZZ', currencyCode: 'ZZZ' },
+            { countryCode: 'GB', currencyCode: 'GBP' },
+          ],
+        });
+        return;
+      }
+      // `/network-partner/supported/routes/{CATEGORY}/{country}/{SOURCE}/{DESTINATION}`. Source
+      // and destination swap with category, exactly as the real endpoint does (verified): a buy's
+      // fiat is the source and the crypto is the destination; a sell's crypto is the source and
+      // the fiat is the destination. Getting this backwards is the one thing `discovery.ts` is
+      // built never to do, so the fake has to model the swap or it cannot catch a regression here.
+      const [, , , , category, country, arg1, arg2] = (req.url ?? '').split('/');
+      const offramp = category === 'CRYPTO_OFFRAMP';
+      const fiat = offramp ? arg2 : arg1;
+      const method = offramp
+        ? { name: 'PAYOUT_TO_BANK', paymentType: 'BANK_TRANSFER', limits: { currencyCode: fiat, min: '5', max: '3000' } }
+        : { name: 'CREDIT_DEBIT_CARD', paymentType: 'CARD', limits: { currencyCode: fiat, min: '5', max: '3000' } };
+      json(country === 'ZZ' ? [] : [{ partner: 'TRANSAK', paymentMethods: [method] }]);
       return;
     }
-    if (req.url?.startsWith('/crypto/session/widget')) {
-      json({
-        id: 'meld-session-e2e',
-        serviceProviderWidgetUrl: 'https://meldcrypto.com/session/e2e',
-        widgetUrl: MELD_WIDGET_URL,
-        expiresAt: null,
+    // Both POST bodies are needed to model the parts of Meld's contract that depend on them,
+    // so they are read here rather than per branch.
+    readBody(req)
+      .then((body) => {
+        if (req.url?.startsWith('/payments/crypto/quote')) {
+          // The boot probe uses this path too, so failing it only after boot keeps the service up.
+          if (opts.failBoot && !started) {
+            json({ code: 'BAD_CREDENTIAL' }, 401);
+            return;
+          }
+          if (opts.failQuote && started) {
+            json({ code: 'UPSTREAM_BOOM' }, 500);
+            return;
+          }
+          // Meld has no direction flag on a quote: it infers the direction from whether the
+          // SOURCE currency is a crypto, and answers "Source currency is not a valid crypto
+          // currency" when a sell is sent the other way round. The fake enforces exactly that,
+          // because a rail that failed to cross the legs would otherwise be served a happy buy
+          // quote and this suite would be blind to the one mistake the seam can make.
+          const source = body.sourceCurrencyCode;
+          const destination = body.destinationCurrencyCode;
+          if (isCrypto(source)) {
+            if (isCrypto(destination)) {
+              json({ code: 'BAD_REQUEST', message: 'Destination currency is not a valid fiat currency' }, 400);
+              return;
+            }
+            // A sell offer, with the fee shape the real one has: fees in the payout fiat,
+            // deducted from the DESTINATION, `sourceAmountWithoutFees` null and
+            // `destinationAmountWithoutFees` populated. Inverted from the buy offer below.
+            json({
+              quotes: [
+                {
+                  transactionType: 'CRYPTO_SELL',
+                  serviceProvider: 'TRANSAK',
+                  sourceAmount: body.sourceAmount,
+                  sourceAmountWithoutFees: null,
+                  sourceCurrencyCode: source,
+                  destinationAmount: '61.93',
+                  destinationAmountWithoutFees: '63.18',
+                  destinationCurrencyCode: destination,
+                  totalFee: '1.25',
+                },
+              ],
+            });
+            return;
+          }
+          json({
+            quotes: [
+              {
+                serviceProvider: 'TRANSAK',
+                sourceAmount: '25.00',
+                sourceCurrencyCode: 'USD',
+                destinationAmount: '24',
+                destinationCurrencyCode: 'USDC_ASSETHUB',
+                totalFee: '1.00',
+              },
+            ],
+          });
+          return;
+        }
+        if (req.url?.startsWith('/crypto/session/widget')) {
+          const data = (body.sessionData ?? {}) as Record<string, unknown>;
+          if (body.sessionType !== 'BUY' && body.sessionType !== 'SELL') {
+            json({ code: 'BAD_REQUEST', errors: ['[sessionType] value is not one of: BUY, SELL, TRANSFER'] }, 400);
+            return;
+          }
+          // The one field whose requirement genuinely differs by direction (verified): a BUY
+          // without `walletAddress` is refused, a SELL without one is accepted.
+          if (body.sessionType === 'BUY' && typeof data.walletAddress !== 'string') {
+            json({ code: 'BAD_REQUEST', errors: ['[sessionData.walletAddress] must not be blank'] }, 400);
+            return;
+          }
+          // And the same source-must-be-crypto rule as the quote, which is server-enforced on
+          // sessions too: `sessionType` and the leg orientation are checked against each other.
+          if ((body.sessionType === 'SELL') !== isCrypto(data.sourceCurrencyCode)) {
+            json({ code: 'BAD_REQUEST', errors: ['Source currency is not a valid crypto currency'] }, 400);
+            return;
+          }
+          json({
+            id: 'meld-session-e2e',
+            serviceProviderWidgetUrl: 'https://meldcrypto.com/session/e2e',
+            widgetUrl: MELD_WIDGET_URL,
+            // Null on a buy, and on a sell Meld omits the key entirely. Both reach the client
+            // as "no expiry", so one spelling covers it here.
+            expiresAt: null,
+          });
+          return;
+        }
+        json({ quotes: [] });
+      })
+      .catch(() => {
+        json({ code: 'BAD_REQUEST', message: 'unreadable body' }, 400);
       });
-      return;
-    }
-    json({ quotes: [] });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   meld = server;
@@ -176,6 +317,7 @@ async function writeConfig(
     worker?: { interval_ms: number; session_max_age_ms: number };
     products?: string[];
     allowedOrigins?: string[];
+    supported?: { catalog_interval_ms: number; routes_interval_ms: number };
   } = {},
 ): Promise<string> {
   const meldKeyPath = join(dir, 'meld.key');
@@ -193,6 +335,14 @@ async function writeConfig(
       api_key: { mode: 'file', path: meldKeyPath },
       api_version: '2025-01-01',
       timeout_ms: 8000,
+      ...(opts.supported === undefined
+        ? {}
+        : {
+            // Must stay under the refresh intervals, and 60s is their floor: hence intervals > 1m.
+            countries_cache_ttl_ms: 60_000,
+            defaults_cache_ttl_ms: 60_000,
+            routes_cache_ttl_ms: 60_000,
+          }),
       boot_probe: {
         destination_code: 'USDC_ASSETHUB',
         source_amount: '20',
@@ -226,6 +376,8 @@ async function writeConfig(
       opts.worker === undefined
         ? { interval_ms: 15000, enabled: false, session_max_age_ms: 86400000 }
         : { ...opts.worker, enabled: true },
+    // Off like the worker; the one test that wants it names its own intervals.
+    supported: opts.supported === undefined ? { enabled: false } : { ...opts.supported, enabled: true },
   };
   const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify(config));
@@ -643,6 +795,204 @@ describe('the service as a process', () => {
 });
 
 describe('the funding journey over real HTTP', () => {
+  it('fills the supported-corridors cache from Meld at boot, and serves it in one payload', async () => {
+    /**
+     * The refresh in a real process, against a real Postgres, over a real socket: the spawned
+     * service walks Meld on its own, writes rows another connection can see, and answers out of
+     * them without touching Meld.
+     *
+     * Boot passes only. Intervals must exceed a minute, so a second pass is not observable here;
+     * the repeat cadence is pinned by the unit tests.
+     */
+    const baseUrl = await fakeMeld();
+    const port = await freePort();
+    const schema = await createSchema();
+    const configPath = await writeConfig(baseUrl, port, schema, {
+      supported: { catalog_interval_ms: 120_000, routes_interval_ms: 120_000 },
+    });
+    child = await startService(configPath, port);
+    const base = `http://127.0.0.1:${String(port)}`;
+
+    // Boot passes run after the port opens, so the first read can legitimately be empty. Both
+    // directions are refreshed for DOT_ASSETHUB (`SUPPORTED_REFRESH_JOBS` in `startup.ts`), so a
+    // filled cache is 4 rows: (BR, US) x (buy, sell).
+    const deadline = Date.now() + 15_000;
+    let rows: Record<string, unknown>[] = [];
+    for (;;) {
+      rows = await rawQuery(schema, 'SELECT direction, country, fiat, methods FROM supported_corridors ORDER BY direction, country');
+      if (rows.length >= 4 || Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    // BR and US only in each direction: NF dropped (no fiat, either direction), ZZ skipped (no
+    // route, either direction).
+    expect(rows.map((r) => [r.direction, r.country])).toEqual([
+      ['buy', 'BR'],
+      ['buy', 'US'],
+      ['sell', 'BR'],
+      ['sell', 'US'],
+    ]);
+    expect(rows.map((r) => r.fiat)).toEqual(['BRL', 'USD', 'BRL', 'USD']);
+
+    // Catalog before routes, and routes asks per country with the catalog's fiat — never
+    // re-reading `defaults`/`fiat-limits`, which is what makes its cadence affordable.
+    const discovery = meldCalls.filter((url) => url.startsWith('/network-partner/'));
+    expect(discovery[0]).toContain('/supported/countries');
+    // Only a buy reads `defaults/`; a sell reads `fiat-limits` instead (see `MeldDiscovery.defaultFiat`).
+    expect(discovery.filter((url) => url.startsWith('/network-partner/defaults/'))).toHaveLength(4);
+    expect(discovery.filter((url) => url.startsWith('/network-partner/supported/fiat-limits'))).toHaveLength(1);
+    // Name-sorted, as `countries` returns and the catalog preserves; buy's job runs before sell's
+    // (`SUPPORTED_REFRESH_JOBS`' order), and each direction's route path has its own argument order.
+    expect(discovery.filter((url) => url.includes('/supported/routes/'))).toEqual([
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT_ASSETHUB/BRL',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT_ASSETHUB/ZZZ',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT_ASSETHUB/USD',
+    ]);
+
+    // And the endpoint serves those rows without going to Meld.
+    const before = meldCalls.length;
+    const response = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB`, {
+      headers: { 'x-dev-product-id': PRODUCT },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      corridors: { country: string; name: string; fiat: string; methods: { paymentMethodType: string; providers?: unknown }[] }[];
+    };
+    expect(body.corridors.map((c) => c.country)).toEqual(['BR', 'US']);
+    expect(body.corridors[0]).toMatchObject({ name: 'Brazil', fiat: 'BRL' });
+    expect(body.corridors[0]?.methods[0]).toMatchObject({ paymentMethodType: 'CREDIT_DEBIT_CARD', min: '5', max: '3000' });
+    // The provider roster never crosses the boundary.
+    expect(body.corridors[0]?.methods[0]?.providers).toBeUndefined();
+
+    // `direction=sell` serves the sibling row, not the buy one: the whole point of the v7 -> v8
+    // migration is that these two never share a slot.
+    const sellResponse = await fetch(`${base}/supported/corridors?destinationCurrencyCode=DOT_ASSETHUB&direction=sell`, {
+      headers: { 'x-dev-product-id': PRODUCT },
+    });
+    expect(sellResponse.status).toBe(200);
+    const sellBody = (await sellResponse.json()) as {
+      corridors: { country: string; methods: { paymentMethodType: string }[] }[];
+    };
+    expect(sellBody.corridors.map((c) => c.country)).toEqual(['BR', 'US']);
+    expect(sellBody.corridors[0]?.methods[0]).toMatchObject({ paymentMethodType: 'PAYOUT_TO_BANK' });
+
+    // Read entirely from Postgres: neither request added a Meld call.
+    expect(meldCalls.length).toBe(before);
+  }, 30_000);
+
+  it('quotes and opens a sell against a Meld that enforces the direction rules', async () => {
+    /**
+     * The sell path end to end, through the built artifact, over a real socket, against a real
+     * Postgres — and against a fake Meld that enforces the two rules the real one enforces: the
+     * source currency must be the crypto on a sell, and `walletAddress` is required on a buy and
+     * not on a sell. That is what makes this more than a smoke test.
+     *
+     * Be precise about what catches a regression here, because the two calls differ. A crossed
+     * sell **session** is refused by the fake with "Source currency is not a valid crypto
+     * currency", which is what the real endpoint answers. A crossed sell **quote** is not: the
+     * real quote endpoint has no direction field and would price a perfectly valid buy and
+     * answer `200`, so the fake does the same, and the only thing that would fail here is the
+     * currency-code assertion on the echoed offer below. Thin, for the more dangerous of the two
+     * calls — which is why `client.ts` now guards the legs before either request is sent, and
+     * a crossed quote fails at this service's own boundary rather than depending on the shape
+     * assertion below to notice.
+     *
+     * **This is as far as a sell can be taken here.** No provider on the account off-ramps
+     * `*_ASSETHUB`, so the real corridor could not be exercised even against the live sandbox;
+     * and nothing yet reads a deposit address back, so the row correctly stops at
+     * `session_opened` and the sale cannot be completed through this service.
+     */
+    const baseUrl = await fakeMeld();
+    const port = await freePort();
+    const schema = await createSchema();
+    const configPath = await writeConfig(baseUrl, port, schema);
+    child = await startService(configPath, port);
+    const base = `http://127.0.0.1:${String(port)}`;
+    const headers = { 'content-type': 'application/json', 'x-dev-product-id': PRODUCT };
+
+    const quote = await fetch(`${base}/quote`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        direction: 'sell',
+        country: 'GB',
+        fiat: 'GBP',
+        destinationCurrencyCode: 'DOT_ASSETHUB',
+        cryptoAmount: '12.3456789012',
+        paymentMethodType: 'PAYOUT_TO_BANK',
+      }),
+    });
+    expect(quote.status).toBe(200);
+    const priced = (await quote.json()) as { quotes: Record<string, unknown>[]; requested: Record<string, unknown> };
+    // The echo names the term the seller committed, and does not name one they did not.
+    expect(priced.requested).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+    });
+    expect(priced.requested).not.toHaveProperty('sourceAmount');
+    // A sell-shaped offer, forwarded whole: the fee is in the payout fiat and comes off the
+    // destination, which is inverted from a buy.
+    expect(priced.quotes[0]).toMatchObject({
+      transactionType: 'CRYPTO_SELL',
+      sourceCurrencyCode: 'DOT_ASSETHUB',
+      destinationCurrencyCode: 'GBP',
+      sourceAmountWithoutFees: null,
+      destinationAmountWithoutFees: '63.18',
+    });
+
+    const session = await fetch(`${base}/session`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        idempotencyKey: 'e2e-sell-0001',
+        direction: 'sell',
+        country: 'GB',
+        fiat: 'GBP',
+        destinationCurrencyCode: 'DOT_ASSETHUB',
+        cryptoAmount: '12.3456789012',
+        paymentMethodType: 'PAYOUT_TO_BANK',
+        serviceProvider: 'TRANSAK',
+      }),
+    });
+    expect(session.status).toBe(201);
+    const created = (await session.json()) as {
+      fundingRequestId: string;
+      expiresAt?: number;
+      pinned: Record<string, unknown>;
+    };
+    expect(created.pinned).toEqual({
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      fiat: 'GBP',
+      country: 'GB',
+    });
+    // Absent, not zero: a sell session carries no provider expiry, so this service's own
+    // ceiling is the whole deadline.
+    expect(created.expiresAt).toBeUndefined();
+
+    // And the durable row, read through a second connection, holds the sell terms and sits at
+    // `session_opened` — which is the correct end state for this step, because nothing yet
+    // observes the seller's deposit.
+    const rows = await rawQuery(
+      schema,
+      'SELECT direction, crypto_amount, source_amount, wallet_address, status, expires_at FROM funding_requests',
+    );
+    expect(rows).toEqual([
+      {
+        direction: 'sell',
+        crypto_amount: '12.3456789012',
+        source_amount: null,
+        wallet_address: null,
+        status: 'session_opened',
+        expires_at: null,
+      },
+    ]);
+  }, 30_000);
+
   it('quotes, creates a session, and lists the request back', async () => {
     const baseUrl = await fakeMeld();
     const port = await freePort();
