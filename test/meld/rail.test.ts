@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { fundingRecord, railSessionInput } from '../fixtures.js';
+import {
+  ALICE,
+  ALICE_PREFIX_42,
+  BOB,
+  fundingRecord,
+  railSellSessionInput,
+  railSessionInput,
+  sellRecord,
+} from '../fixtures.js';
 
-import { MeldClient } from '../../src/meld/client.js';
+import { upstreamUnavailable } from '../../src/contract.js';
+import { MeldClient, MeldHttpError } from '../../src/meld/client.js';
 import { Secret } from '../../src/secret.js';
 import { MeldRail } from '../../src/meld/rail.js';
 
@@ -12,6 +21,10 @@ const OFFERS = [{ serviceProvider: 'TRANSAK', sourceAmount: '21.47' }];
 
 const client = (saveWidget?: () => Promise<Record<string, unknown>>) => {
   const quote = vi.fn(async (): Promise<unknown[]> => OFFERS);
+  // Separate from `quote`, exactly as the client's two methods are. A single spy would make
+  // "the rail called the sell path" indistinguishable from "the rail called the buy path with
+  // the values swapped", which is the one mistake this seam can make.
+  const quoteSell = vi.fn(async (): Promise<unknown[]> => OFFERS);
   const createWidgetSession = vi.fn(
     async () =>
       saveWidget?.() ?? {
@@ -21,8 +34,8 @@ const client = (saveWidget?: () => Promise<Record<string, unknown>>) => {
       },
   );
   const transaction = vi.fn(async () => ({ id: 'tx-1', status: 'SUCCEEDED' }));
-  const stub = { quote, createWidgetSession, transaction } as unknown as MeldClient;
-  return { stub, quote, createWidgetSession, transaction };
+  const stub = { quote, quoteSell, createWidgetSession, transaction } as unknown as MeldClient;
+  return { stub, quote, quoteSell, createWidgetSession, transaction };
 };
 
 describe('the rail over a real client', () => {
@@ -90,11 +103,91 @@ describe('MeldRail', () => {
     expect(new MeldRail(client().stub).provider).toBe('meld');
   });
 
+  it("crosses the two vocabularies on a sell quote: the port's destination is Meld's source", async () => {
+    // The one thing this rail does on a sell that a rename would not. The port names the crypto
+    // leg `destinationCurrencyCode` in **both** directions (one vocabulary for the consumer),
+    // while Meld derives the direction of a quote purely from which of its own legs holds a
+    // crypto. So the two namings cross here, and getting the crossing backwards does not fail
+    // loudly: Meld would price a buy, or refuse with a currency error about the caller's own
+    // request. Asserted field by field for that reason.
+    const { stub, quote, quoteSell } = client();
+    const rail = new MeldRail(stub);
+
+    const offers = await rail.quote({
+      direction: 'sell',
+      countryCode: 'GB',
+      sourceCurrencyCode: 'GBP',
+      destinationCurrencyCode: 'DOT_ASSETHUB',
+      cryptoAmount: '12.3456789012',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+
+    expect(quoteSell).toHaveBeenCalledWith({
+      countryCode: 'GB',
+      // The port's `destinationCurrencyCode`, which is Meld's *source* on a sell.
+      cryptoCurrencyCode: 'DOT_ASSETHUB',
+      // The port's `sourceCurrencyCode`, which is Meld's *destination* on a sell.
+      fiatCurrencyCode: 'GBP',
+      cryptoAmount: '12.3456789012',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+    });
+    // And not the buy method with the values swapped into it. The two are separate on the client
+    // precisely so that neither direction can be served by filling in the other's struct.
+    expect(quote).not.toHaveBeenCalled();
+    expect(offers).toEqual(OFFERS);
+  });
+
+  it('opens a sell session with the legs crossed, the crypto amount, and no address', async () => {
+    const { stub, createWidgetSession } = client();
+    const rail = new MeldRail(stub);
+
+    const session = await rail.createSession(
+      railSellSessionInput({ clientReference: 'funding-sell-1', redirectUrl: 'https://app.example/sold' }),
+    );
+
+    // `toEqual` on the whole argument rather than `toMatchObject`: the absence of a
+    // `walletAddress` is one of the things being asserted, and a partial match cannot assert an
+    // absence. A sell has no caller-supplied address, Meld does not require one, and Meld's
+    // session endpoint accepts unknown fields with a `200` — so nothing upstream would object to
+    // a stray one and this seam is where it would have to be invented.
+    expect(createWidgetSession).toHaveBeenCalledWith({
+      direction: 'sell',
+      cryptoCurrencyCode: 'DOT_ASSETHUB',
+      fiatCurrencyCode: 'GBP',
+      cryptoAmount: '12.3456789012',
+      countryCode: 'GB',
+      paymentMethodType: 'PAYOUT_TO_BANK',
+      serviceProvider: 'TRANSAK',
+      clientReference: 'funding-sell-1',
+      redirectUrl: 'https://app.example/sold',
+    });
+    expect(session.providerSessionId).toBe('meld-1');
+  });
+
+  it('carries no expiry on a sell when Meld supplies none, which is always', async () => {
+    // Observed against the sandbox: a SELL session response has no `expiresAt` key at all, ever.
+    // So `expires_at` is null on every sell row and the worker's local ceiling is the whole of
+    // that row's deadline rather than a floor under a provider one. Pinned here because the rail
+    // is where a helpful default would be tempting, and a fabricated expiry on a sell is a
+    // deadline this service invented for a seller's on-chain deposit.
+    const { stub } = client(async () => ({
+      meldSessionId: 'meld-sell-1',
+      serviceProviderWidgetUrl: 'https://meldcrypto.com/s/sell',
+      meldWidgetUrl: undefined,
+      expiresAt: undefined,
+    }));
+
+    const session = await new MeldRail(stub).createSession(railSellSessionInput());
+
+    expect(session.expiresAt).toBeUndefined();
+  });
+
   it('maps a neutral quote onto the Meld client and echoes the canonical requested shape', async () => {
     const { stub, quote } = client();
     const rail = new MeldRail(stub);
 
     const offers = await rail.quote({
+      direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
       destinationCurrencyCode: 'USDC_ASSETHUB',
@@ -103,6 +196,7 @@ describe('MeldRail', () => {
     });
 
     expect(quote).toHaveBeenCalledWith({
+      direction: 'buy',
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
       destinationCurrencyCode: 'USDC_ASSETHUB',
@@ -127,6 +221,9 @@ describe('MeldRail', () => {
     );
 
     expect(createWidgetSession).toHaveBeenCalledWith({
+      // Stated on a buy too, not defaulted. The client reads `sessionType` off this field and
+      // nothing else, so a buy that failed to name its direction would not silently stay a buy.
+      direction: 'buy',
       destinationCode: 'USDC_ASSETHUB',
       walletAddress: '5x...',
       sourceAmount: '25.00',
@@ -244,4 +341,249 @@ describe('MeldRail.observation', () => {
       expect(new MeldRail({} as unknown as MeldClient).observation().mapper(status)).toBe('transaction_seen');
     },
   );
+
+  describe('the deposit disclosure', () => {
+    /** A client whose session lookup and reference search answer from fixed transactions. */
+    const sellClient = (byReference: unknown, bySession?: unknown) => {
+      const transactionByReference = vi.fn(async () => byReference);
+      const transactionBySession = vi.fn(async () => bySession);
+      return {
+        transactionByReference,
+        transactionBySession,
+        rail: new MeldRail({ transactionByReference, transactionBySession } as unknown as MeldClient),
+      };
+    };
+
+    it('never surfaces one for a buy, even when the transaction carries the field', async () => {
+      // A buy's wallet address is the caller's own, sent before the session opened; there is
+      // nothing for a provider to disclose, no matter what the transaction record says.
+      const { rail, transactionBySession } = sellClient({
+        id: 'tx-1',
+        status: 'SETTLED',
+        cryptoDetails: {
+          offrampDestinationWalletAddress: '1SomeAddress',
+          destinationWalletAddress: '1TheBuyersOwnAddress',
+        },
+      });
+
+      const seen = await rail.observation().finder(recordWith('idem-1'));
+
+      expect(seen).not.toHaveProperty('deposit');
+      // And a buy is never looked up by session: it stays on the reference it is observed on.
+      expect(transactionBySession).not.toHaveBeenCalled();
+    });
+
+    it('reads a sell by its Meld session first, the lookup Meld documents for it', async () => {
+      const { rail, transactionBySession, transactionByReference } = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        sourceCurrencyCode: 'DOT_ASSETHUB',
+        cryptoDetails: { destinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(transactionBySession).toHaveBeenCalledWith('meld-1');
+      expect(transactionByReference).not.toHaveBeenCalled();
+      expect(seen?.deposit).toEqual({
+        address: '1DepositAddress',
+        amount: '12.3456789012',
+        currency: 'DOT_ASSETHUB',
+      });
+    });
+
+    it('falls back to the reference while the session has no transaction, or no session is known', async () => {
+      const found = {
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        sourceCurrencyCode: 'DOT_ASSETHUB',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      };
+      const pending = sellClient(found);
+      const seen = await pending.rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+      expect(pending.transactionByReference).toHaveBeenCalledWith('funding-1');
+      expect(seen?.deposit).toEqual({
+        address: '1DepositAddress',
+        amount: '12.3456789012',
+        currency: 'DOT_ASSETHUB',
+      });
+
+      const sessionless = sellClient(found);
+      await sessionless.rail.observation().finder(sellRecord({ provider_session_id: undefined }));
+      expect(sessionless.transactionBySession).not.toHaveBeenCalled();
+      expect(sessionless.transactionByReference).toHaveBeenCalledWith('funding-1');
+    });
+
+    it.each([
+      ['a 5xx', new MeldHttpError(503)],
+      ['a 404 that is not "not yet created"', new MeldHttpError(404, 'SOMETHING_ELSE')],
+      ['a transport failure or a body that does not read', upstreamUnavailable('Meld GET failed: fetch failed')],
+    ])('falls back to the reference when the session lookup fails with %s', async (_kind, failure) => {
+      // The reference can still answer. Thrown out of the finder, this would fail the poll, and
+      // every sell in the tick would count towards the worker's failure ceiling while it did.
+      const { rail, transactionBySession, transactionByReference } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        sourceCurrencyCode: 'DOT_ASSETHUB',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+      transactionBySession.mockRejectedValue(failure);
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(transactionBySession).toHaveBeenCalledWith('meld-1');
+      expect(transactionByReference).toHaveBeenCalledWith('funding-1');
+      expect(seen).toEqual({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: '1DepositAddress', amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      });
+    });
+
+    it("propagates the reference's own failure when the session lookup has failed too", async () => {
+      // Neither lookup answered, so there is no "nothing yet" to report: the throw is what lets
+      // the worker conclude `unobserved` past the window rather than `expired`.
+      const { rail, transactionBySession, transactionByReference } = sellClient(undefined);
+      const failure = new MeldHttpError(502);
+      transactionBySession.mockRejectedValue(new MeldHttpError(503));
+      transactionByReference.mockRejectedValue(failure);
+
+      await expect(rail.observation().finder(sellRecord())).rejects.toBe(failure);
+    });
+
+    it('prefers the address under its 2025-03-04 name, and reads the old one without it', async () => {
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      // Both present for one account: the new name's spelling is the one disclosed.
+      const both = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: {
+          destinationWalletAddress: ALICE_PREFIX_42,
+          offrampDestinationWalletAddress: ALICE,
+        },
+      });
+      expect((await both.rail.observation().finder(sellRecord()))?.deposit?.address).toBe(ALICE_PREFIX_42);
+
+      const old = sellClient(undefined, {
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: null, offrampDestinationWalletAddress: '1OldName' },
+      });
+      expect((await old.rail.observation().finder(sellRecord()))?.deposit?.address).toBe('1OldName');
+    });
+
+    it('omits the deposit for a sell until the provider discloses an address', async () => {
+      const { rail } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        cryptoDetails: { offrampDestinationWalletAddress: null },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(seen).not.toHaveProperty('deposit');
+    });
+
+    it('withholds the deposit while Meld names no amount, never filling in the committed one', async () => {
+      // The committed figure would always agree with itself: a client holding its own terms could
+      // never see that the provider expects something else.
+      const { rail } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: null,
+        sourceCurrencyCode: 'DOT_ASSETHUB',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(seen).toEqual({ id: 'tx-1', status: 'PENDING' });
+    });
+
+    it("withholds the deposit while Meld names no asset, never standing in the row's own", async () => {
+      const { rail } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '12.3456789012',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(seen).not.toHaveProperty('deposit');
+    });
+
+    it('discloses the asset and the amount as the provider states them, even where they differ from the committed terms', async () => {
+      // Whether the provider honours the locked asset and amount on a sell is unverified. Shown
+      // as stated, a difference is the client's to refuse.
+      const { rail } = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        sourceAmount: '11',
+        sourceCurrencyCode: 'USDT_ASSETHUB',
+        cryptoDetails: { offrampDestinationWalletAddress: '1DepositAddress' },
+      });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(seen?.deposit).toEqual({ address: '1DepositAddress', amount: '11', currency: 'USDT_ASSETHUB' });
+    });
+
+    it('reads a blank field as absent', async () => {
+      // A blank new name would otherwise shadow the old one, and a blank amount would pass as one.
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const fallback = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: '', offrampDestinationWalletAddress: ALICE },
+      });
+      expect((await fallback.rail.observation().finder(sellRecord()))?.deposit?.address).toBe(ALICE);
+
+      for (const blank of [{ sourceAmount: ' ' }, { sourceCurrencyCode: '' }]) {
+        const { rail } = sellClient({
+          id: 'tx-1',
+          status: 'PENDING',
+          ...terms,
+          ...blank,
+          cryptoDetails: { destinationWalletAddress: ALICE },
+        });
+        expect(await rail.observation().finder(sellRecord())).not.toHaveProperty('deposit');
+      }
+    });
+
+    it('discloses nothing when the two address fields name different accounts', async () => {
+      const terms = { sourceAmount: '12.3456789012', sourceCurrencyCode: 'DOT_ASSETHUB' };
+      const split = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: ALICE, offrampDestinationWalletAddress: BOB },
+      });
+      expect(await split.rail.observation().finder(sellRecord())).not.toHaveProperty('deposit');
+
+      // One account under two prefixes is one address.
+      const agreed = sellClient({
+        id: 'tx-1',
+        status: 'PENDING',
+        ...terms,
+        cryptoDetails: { destinationWalletAddress: ALICE_PREFIX_42, offrampDestinationWalletAddress: ALICE },
+      });
+      expect((await agreed.rail.observation().finder(sellRecord()))?.deposit?.address).toBe(ALICE_PREFIX_42);
+    });
+
+    it('omits the deposit for a sell whose transaction carries no cryptoDetails at all', async () => {
+      const { rail } = sellClient({ id: 'tx-1', status: 'PENDING' });
+
+      const seen = await rail.observation().finder(sellRecord({ client_reference: 'idem-1' }));
+
+      expect(seen).not.toHaveProperty('deposit');
+    });
+  });
 });

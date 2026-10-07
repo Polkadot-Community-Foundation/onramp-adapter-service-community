@@ -16,17 +16,36 @@ import { loadConfig, type Config } from './config.js';
 import { ChainflipRail } from './chainflip/rail.js';
 import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
+import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
 import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
-import type { RailName, RailRegistry } from './rail.js';
+import { DIRECTIONS, type RailName, type RailRegistry } from './rail.js';
 import { PersonhoodService, type PersonhoodDeps } from './personhood.js';
 import { chainReader } from './personhood/chain.js';
 import { commitmentsFrom } from './personhood/source.js';
 import { validateWithCommitment } from './personhood/verifiablejs.js';
 import { resolveSecret } from './secret.js';
 import { buildServer } from './server.js';
+
+// The cryptos the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
+const SUPPORTED_REFRESH_CRYPTOS = ['DOT_ASSETHUB'];
+
+/**
+ * Every (crypto, direction) the refresh walks: both directions for each configured crypto.
+ *
+ * A crypto sellable here is not necessarily one Meld actually routes for this account -- the
+ * probe found no provider on the sandbox account off-ramps any `*_ASSETHUB` asset at all, so a
+ * `sell` job for `DOT_ASSETHUB` legitimately writes nothing until a provider that does exists.
+ * That is a fact about Meld's current onboarding, not a reason to leave the job unwired: the
+ * refresh's whole design (upsert-only, ages out on staleness) already treats "nothing to write"
+ * as an ordinary outcome, not a failure, and the day a provider does off-ramp the asset this job
+ * starts producing rows with no code change.
+ */
+const SUPPORTED_REFRESH_JOBS: readonly RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
+  DIRECTIONS.map((direction) => ({ crypto, direction })),
+);
 
 /** A listening service, and the one call that takes it down. */
 interface ServerHandle {
@@ -69,7 +88,7 @@ export async function start(
   // reads through the client's keyed GET so Meld returns this account's providers (sandbox -> its
   // onboarded set); the
   // provider is Meld's to choose at quote time and is never named here. `global` reads unkeyed for
-  // a fully-provisioned production. Lazily populated and cached for `supported_cache_ttl_ms`.
+  // a fully-provisioned production. Lazily populated, each endpoint cached on its own lifetime.
   const discoveryGet =
     cfg.meld.discovery_scope === 'global' ? meld.publicGet.bind(meld) : meld.authedGet.bind(meld);
   // The country list is always the global one, whatever `discovery_scope` says; it feeds a
@@ -80,7 +99,11 @@ export async function start(
   // answers whether the crypto actually routes there. See MeldDiscovery's header.
   const discovery = new MeldDiscovery(
     discoveryGet,
-    cfg.meld.supported_cache_ttl_ms,
+    {
+      countries: cfg.meld.countries_cache_ttl_ms,
+      defaults: cfg.meld.defaults_cache_ttl_ms,
+      routes: cfg.meld.routes_cache_ttl_ms,
+    },
     undefined,
     meld.publicGet.bind(meld),
   );
@@ -118,6 +141,7 @@ export async function start(
   // event, shipped wherever PCF already ships logs. See `audit.ts` on why not a database.
   let app: Awaited<ReturnType<typeof buildServer>> | undefined;
   let worker: ReturnType<typeof startWorker> | undefined;
+  let supported: ReturnType<typeof startSupportedRefresh> | undefined;
   // The worker starts only after this and after the port opens. Constructed earlier, a boot that
   // then failed on a bad credential would leave a loop advancing durable funding rows with no
   // handle to stop it, because `start` rejects and the caller never gets a `close`.
@@ -206,8 +230,13 @@ export async function start(
           // it only survives at `silent`, which is what the tests use. The worker's error handler
           // calls this sink, so an unbound one turned any tick error into an unhandled rejection
           // and took the process down, the exact outcome the handler exists to prevent.
-          (message) => {
-            server.log.warn(message);
+          //
+          // `level` defaults to `'warn'`, which is every call this worker made before it could
+          // also ask for `'error'`. The one caller that does (a deposit-address disclosure
+          // conflict) needs to read differently in an aggregator from the routine per-record
+          // failure beside it, which this same sink also carries.
+          (message, level = 'warn') => {
+            server.log[level](message);
           },
           undefined,
           undefined,
@@ -215,6 +244,20 @@ export async function start(
           // here rather than as a scheduled job outside the service: one fewer thing to deploy
           // and one fewer thing to forget.
           cfg.worker.refusal_retention_days,
+        )
+      : undefined;
+
+    // The supported-corridors refresh, started last like the worker so a failed boot leaves no unstoppable loop.
+    supported = cfg.supported.enabled
+      ? startSupportedRefresh(
+          discovery,
+          funding,
+          SUPPORTED_REFRESH_JOBS,
+          { catalogMs: cfg.supported.catalog_interval_ms, routesMs: cfg.supported.routes_interval_ms },
+          // warn, not info: a silently staling cache must reach an operator filtering to warn.
+          (message) => {
+            server.log.warn(message);
+          },
         )
       : undefined;
   } catch (error) {
@@ -227,6 +270,10 @@ export async function start(
     // second cleanup path is a second thing to keep in step with this one.
     //
     // `app` is undefined only when `buildServer` itself threw, and then there is nothing to close.
+    // Stop the loops too: they are the last things started so this is defensive today, but it keeps
+    // the cleanup complete if a throwing step is ever added after them.
+    await worker?.stop();
+    await supported?.stop();
     await app?.close();
     await funding.close();
     throw error;
@@ -241,6 +288,7 @@ export async function start(
       // one stopped. Draining the pool also returns its CloudSQL connections promptly instead of
       // leaving the server to time them out.
       await worker?.stop();
+      await supported?.stop();
       await app.close();
       await funding.close();
     },
