@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { fakeStore, fundingRecord } from '../fixtures.js';
+import { ALICE, ALICE_PREFIX_42, BOB, fakeStore, fundingRecord } from '../fixtures.js';
 
 import type { FundingRecord } from '../../src/funding/types.js';
 import {
@@ -19,10 +19,24 @@ import type { RailName } from '../../src/rail.js';
 const NOW = 1_700_000_000_000;
 /** The local ceiling for a session the rail gave no expiry for. A day, as config defaults to. */
 const MAX_AGE = 24 * 3_600_000;
-/** A sink for the tick's per-record error reports; tests that care assert on it. */
+/**
+ * A sink for the tick's per-record error reports; tests that care assert on it.
+ *
+ * `levels` is parallel to `lines` (same index), opt-in: the ~30 existing assertions against
+ * `lines` alone are untouched, and the one test that needs to tell a deposit-conflict alarm's
+ * `'error'` apart from the routine `'warn'` beside it reads `levels` too.
+ */
 const notes = () => {
   const lines: string[] = [];
-  return { lines, log: (m: string) => lines.push(m) };
+  const levels: Array<'warn' | 'error'> = [];
+  return {
+    lines,
+    levels,
+    log: (m: string, level: 'warn' | 'error' = 'warn') => {
+      lines.push(m);
+      levels.push(level);
+    },
+  };
 };
 /** "Still in flight": what a mapper says when no terminal rule applies yet. */
 const INCONCLUSIVE: TransactionMapper = () => 'transaction_seen';
@@ -1706,6 +1720,535 @@ describe('a transaction seen but never concluded', () => {
 
     expect(advanced).toBe(1);
     expect((await store.byId('funding-1'))?.status).toBe('settled');
+    await store.close();
+  });
+});
+
+describe('a sell whose provider discloses a deposit address', () => {
+  const inFlight = (overrides: Partial<FundingRecord> = {}): FundingRecord =>
+    record({
+      direction: 'sell',
+      destination_currency_code: 'DOT_ASSETHUB',
+      wallet_address: undefined,
+      source_amount: undefined,
+      crypto_amount: '12.3456789012',
+      status: 'transaction_seen',
+      status_history: [{ status: 'transaction_seen', at: NOW }],
+      provider_transaction_id: 'tx-1',
+      provider_status: 'PENDING',
+      ...overrides,
+    });
+
+  it('writes the disclosure even though the mapped state does not move', async () => {
+    // The structural fix this step makes: before it, `tick` skipped the write whenever the state
+    // did not change, so a deposit address disclosed while a row sat in `transaction_seen` would
+    // never reach the store at all.
+    const { store, updated } = tracking([inFlight()]);
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(updated).toHaveBeenCalled();
+    // `advanced` counts a write happened, even though the funding state itself is unchanged.
+    expect(advanced).toBe(1);
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('transaction_seen');
+    expect(row?.deposit_address).toBe(ALICE);
+    expect(row?.deposit_amount).toBe('12.3456789012');
+    expect(row?.deposit_observed_at).toBe(NOW);
+    await store.close();
+  });
+
+  it('carries a deposit disclosed the same moment a transaction is first seen', async () => {
+    // The other, likely more common shape: Meld's deposit address lives on the transaction
+    // record, so it can be populated the very first time a transaction exists at all.
+    const opening = record({
+      direction: 'sell',
+      destination_currency_code: 'DOT_ASSETHUB',
+      wallet_address: undefined,
+      source_amount: undefined,
+      crypto_amount: '12.3456789012',
+      status: 'session_opened',
+    });
+    const { store } = tracking([opening]);
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(advanced).toBe(1);
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('transaction_seen');
+    expect(row?.deposit_address).toBe(ALICE);
+    await store.close();
+  });
+
+  it('carries no deposit when the transaction it first sees has already ended', async () => {
+    // This edge can only reach `transaction_seen`, which reads as live until the next tick
+    // concludes it, so a deposit carried here would be shown for an order that takes no deposit.
+    const opening = record({
+      direction: 'sell',
+      destination_currency_code: 'DOT_ASSETHUB',
+      wallet_address: undefined,
+      source_amount: undefined,
+      crypto_amount: '12.3456789012',
+      status: 'session_opened',
+    });
+    const { store } = tracking([opening]);
+
+    await tick(
+      store,
+      NOW,
+      observations(
+        async () => ({
+          id: 'tx-1',
+          status: 'FAILED',
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        }),
+        (status) => (status === 'FAILED' ? 'failed' : 'transaction_seen'),
+      ),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('transaction_seen');
+    expect(row?.deposit_address).toBeUndefined();
+    await store.close();
+  });
+
+  it('does not write anything when re-observation finds the same status and no new fact', async () => {
+    // The unchanged half of the same branch: nothing regressed for the ordinary "still pending,
+    // nothing new" tick once the skip condition grew a second clause.
+    const { store, updated } = tracking([inFlight()]);
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(async () => ({ id: 'tx-1', status: 'PENDING' })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(advanced).toBe(0);
+    expect(updated).not.toHaveBeenCalled();
+    await store.close();
+  });
+
+  it('records the conflict, at its own log level, and leaves the disclosed address untouched', async () => {
+    // The fix over the first version of this behaviour: a conflicting address no longer throws
+    // and rolls back the write (see `mergeDeposit`). It is instead recorded, and the alarm has to
+    // come from somewhere else now that no error propagates -- `tick` raises it itself, at
+    // `'error'`, on its own line, distinguishable from the generic per-record `'warn'` failure
+    // that a transient rail hiccup produces just as easily.
+    const { store } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const { lines, levels, log } = notes();
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      log,
+      lease(),
+    );
+
+    // The write happened (it records the conflict), so it counts as an advance even though the
+    // deposit itself did not change.
+    expect(advanced).toBe(1);
+    const alarmIndex = lines.findIndex((line) => line.includes('funding-1') && line.includes('conflicting deposit'));
+    expect(alarmIndex).toBeGreaterThanOrEqual(0);
+    expect(levels[alarmIndex]).toBe('error');
+    // Not the generic per-record failure line: nothing threw.
+    expect(lines.some((line) => line.includes('could not advance'))).toBe(false);
+
+    const row = await store.byId('funding-1');
+    expect(row?.deposit_address).toBe(ALICE);
+    expect(row?.deposit_conflict_address).toBe(BOB);
+    expect(row?.deposit_conflict_reason).toBe('address_changed');
+    await store.close();
+  });
+
+  it('lets an unrelated, legitimate conclusion through beside a conflicting disclosure', async () => {
+    // The heart of the fix: a provider that keeps disclosing a wrong address must not also be
+    // able to freeze a row that would otherwise correctly settle.
+    const { store } = tracking([
+      inFlight({ id: 'bad', deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
+      inFlight({ id: 'good', provider_transaction_id: 'tx-2' }),
+    ]);
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(
+        async (rec) =>
+          rec.id === 'bad'
+            ? { id: 'tx-1', status: 'PENDING', deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' } }
+            : { id: 'tx-2', status: 'SETTLED' },
+        (status) => (status === 'SETTLED' ? 'settled' : 'transaction_seen'),
+      ),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    // Both rows advanced: `good` settled, and `bad` recorded its conflict rather than blocking.
+    expect(advanced).toBe(2);
+    expect((await store.byId('good'))?.status).toBe('settled');
+    const bad = await store.byId('bad');
+    expect(bad?.status).toBe('transaction_seen');
+    expect(bad?.deposit_address).toBe(ALICE);
+    expect(bad?.deposit_conflict_address).toBe(BOB);
+  });
+
+  it('does not keep writing every tick once the same conflict has already been recorded', async () => {
+    // The other half of the fix for finding 1: a rail that keeps disclosing the exact same wrong
+    // address must not re-trigger a write (and re-stamp `updated_at`) on every single tick either,
+    // or the row's `deadlineFor` window slides forward for ever just as it did for a clean
+    // disclosure.
+    const conflicted = inFlight({
+      deposit_address: ALICE,
+      deposit_amount: '1.0',
+      deposit_currency: 'DOT_ASSETHUB',
+      deposit_conflict_address: BOB,
+      deposit_conflict_reason: 'address_changed',
+      deposit_conflict_at: NOW - 1_000,
+    });
+    const { store, updated } = tracking([conflicted]);
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: BOB, amount: '1.0', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(advanced).toBe(0);
+    expect(updated).not.toHaveBeenCalled();
+    await store.close();
+  });
+
+  it('does not keep writing when the accepted address is re-disclosed under a different prefix', async () => {
+    // The regression this step's second review caught: `mergeDeposit` always stores
+    // `deposit_address` canonicalised (prefix 0), but a rail's raw report is not obliged to use
+    // that prefix -- SS58's *default* prefix is 42, not 0 (see `address.ts`), so a raw-to-raw
+    // comparison here would treat the ordinary case of a rail consistently using its own default
+    // encoding as "new" on every single poll, for ever, undoing finding 1's fix for the realistic
+    // case rather than an exotic one. `ALICE_PREFIX_42` is the same 32-byte account as `ALICE`,
+    // just encoded under the default prefix, so a rail reporting it after `ALICE` was already
+    // accepted must not trigger a write.
+    const accepted = inFlight({
+      deposit_address: ALICE,
+      deposit_amount: '12.3456789012',
+      deposit_currency: 'DOT_ASSETHUB',
+    });
+    const { store, updated } = tracking([accepted]);
+
+    const advanced = await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE_PREFIX_42, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(advanced).toBe(0);
+    expect(updated).not.toHaveBeenCalled();
+    // And no false conflict was ever recorded either: this was never treated as a disagreement in
+    // the first place, so there is nothing for the store to have written and nothing to read back.
+    expect((await store.byId('funding-1'))?.deposit_conflict_address).toBeUndefined();
+    await store.close();
+  });
+
+  it('does not keep writing when the accepted amount is re-disclosed in another spelling', async () => {
+    // A sell's first disclosure can carry the row's own committed figure, and Meld's later one for
+    // the same amount need not be spelled the same way. Compared as text, every poll would write.
+    for (const amount of ['23.45210000', '023.4521', '23.4521']) {
+      const { store, updated } = tracking([
+        inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+      ]);
+
+      const advanced = await tick(
+        store,
+        NOW,
+        observations(async () => ({
+          id: 'tx-1',
+          status: 'PENDING',
+          deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+        })),
+        MAX_AGE,
+        () => undefined,
+        lease(),
+      );
+
+      expect(advanced).toBe(0);
+      expect(updated).not.toHaveBeenCalled();
+      await store.close();
+    }
+  });
+
+  it('records a different amount, or one not spelled the same, as a conflict, once', async () => {
+    // By value only for plain decimals: another value, and any other shape spelled differently,
+    // reach the store, which keeps the amount first shown and records the change. The next poll
+    // with the same figure is nothing new, so a restated amount causes one write, not one per tick.
+    for (const [stored, amount] of [
+      ['23.4521', '23.4522'],
+      ['1e1', '10'],
+    ] as const) {
+      const { store, updated } = tracking([
+        inFlight({ deposit_address: ALICE, deposit_amount: stored, deposit_currency: 'DOT_ASSETHUB' }),
+      ]);
+      const restated = observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount, currency: 'DOT_ASSETHUB' },
+      }));
+
+      await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
+      expect(updated).toHaveBeenCalledTimes(1);
+      expect(await store.byId('funding-1')).toMatchObject({
+        deposit_amount: stored,
+        deposit_conflict_reason: 'terms_changed',
+        deposit_conflict_at: NOW,
+      });
+
+      await tick(store, NOW + 1_000, restated, MAX_AGE, () => undefined, lease());
+      expect(updated).toHaveBeenCalledTimes(1);
+      await store.close();
+    }
+  });
+
+  it('records an asset the provider restates for the same address as a conflict, once', async () => {
+    const { store, updated } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const restated = observations(async () => ({
+      id: 'tx-1',
+      status: 'PENDING',
+      deposit: { address: ALICE, amount: '23.4521', currency: 'USDT_ASSETHUB' },
+    }));
+
+    await tick(store, NOW, restated, MAX_AGE, () => undefined, lease());
+    await tick(store, NOW + 1_000, restated, MAX_AGE, () => undefined, lease());
+
+    expect(updated).toHaveBeenCalledTimes(1);
+    expect(await store.byId('funding-1')).toMatchObject({
+      deposit_currency: 'DOT_ASSETHUB',
+      deposit_conflict_reason: 'terms_changed',
+    });
+    await store.close();
+  });
+
+  it('ages a row out from when it reached transaction_seen, however often its deposit was written since', async () => {
+    // Each deposit write moves `updated_at`; measured from there, a provider restating its terms
+    // would keep the row asked for ever.
+    const { store } = tracking([
+      inFlight({
+        deposit_address: ALICE,
+        deposit_amount: '1.0',
+        deposit_currency: 'DOT_ASSETHUB',
+        updated_at: NOW + MAX_AGE,
+      }),
+    ]);
+
+    await tick(store, NOW + MAX_AGE + 1, observations(async () => undefined), MAX_AGE, () => undefined, lease());
+
+    expect((await store.byId('funding-1'))?.status).toBe('unobserved');
+    await store.close();
+  });
+
+  it('takes an amount on a row whose address landed without one as a change, once', async () => {
+    // No rail writes such a row (a disclosure always names its amount), but the column allows it,
+    // and a figure appearing after the address is not one a client was shown.
+    const { store, updated } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: undefined, deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const disclosed = observations(async () => ({
+      id: 'tx-1',
+      status: 'PENDING',
+      deposit: { address: ALICE, amount: '23.4521', currency: 'DOT_ASSETHUB' },
+    }));
+
+    await tick(store, NOW, disclosed, MAX_AGE, () => undefined, lease());
+    expect(updated).toHaveBeenCalledTimes(1);
+    expect(await store.byId('funding-1')).toMatchObject({
+      deposit_amount: undefined,
+      deposit_conflict_reason: 'terms_changed',
+    });
+
+    await tick(store, NOW + 1_000, disclosed, MAX_AGE, () => undefined, lease());
+    expect(updated).toHaveBeenCalledTimes(1);
+    await store.close();
+  });
+
+  it('reads a repeated amount that is not a plain decimal as the same only when it is spelled the same', async () => {
+    const { store, updated } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '1e1', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+
+    await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount: '1e1', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    expect(updated).not.toHaveBeenCalled();
+    await store.close();
+  });
+
+  it('logs a restated term as a conflict that needs a person', async () => {
+    const { store } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '23.4521', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const { lines, log } = notes();
+
+    await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: ALICE, amount: '20', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      log,
+      lease(),
+    );
+
+    const line = lines.find((entry) => entry.includes('funding-1') && entry.includes('terms_changed'));
+    expect(line).toContain('is no longer shown');
+    await store.close();
+  });
+
+  it('writes no deposit onto the move that concludes the order', async () => {
+    // A deposit is a fact about a live order; a concluded row carrying one would read as an
+    // address someone was shown.
+    const { store } = tracking([inFlight()]);
+
+    await tick(
+      store,
+      NOW,
+      observations(
+        async () => ({
+          id: 'tx-1',
+          status: 'FAILED',
+          deposit: { address: ALICE, amount: '12.3456789012', currency: 'DOT_ASSETHUB' },
+        }),
+        (status) => (status === 'FAILED' ? 'failed' : 'transaction_seen'),
+      ),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    const row = await store.byId('funding-1');
+    expect(row?.status).toBe('failed');
+    expect(row?.deposit_address).toBeUndefined();
+    await store.close();
+  });
+
+  it('takes a malformed report from before the address landed, repeated after it, as a new conflict', async () => {
+    const { store } = tracking([
+      inFlight({
+        deposit_address: ALICE,
+        deposit_amount: '1.0',
+        deposit_currency: 'DOT_ASSETHUB',
+        deposit_observed_at: NOW - 1_000,
+        deposit_conflict_address: 'not-an-account',
+        deposit_conflict_reason: 'address_malformed',
+        deposit_conflict_at: NOW - 2_000,
+      }),
+    ]);
+
+    await tick(
+      store,
+      NOW,
+      observations(async () => ({
+        id: 'tx-1',
+        status: 'PENDING',
+        deposit: { address: 'not-an-account', amount: '1.0', currency: 'DOT_ASSETHUB' },
+      })),
+      MAX_AGE,
+      () => undefined,
+      lease(),
+    );
+
+    const row = await store.byId('funding-1');
+    expect(row?.deposit_conflict_at).toBe(NOW);
+    expect(row?.deposit_address).toBe(ALICE);
+    await store.close();
+  });
+
+  it('logs, on ageing out, that an address was disclosed with no settlement ever observed', async () => {
+    const { store } = tracking([
+      inFlight({ deposit_address: ALICE, deposit_amount: '1.0', deposit_currency: 'DOT_ASSETHUB' }),
+    ]);
+    const { lines, log } = notes();
+
+    await tick(store, NOW + MAX_AGE + 1, observations(async () => undefined), MAX_AGE, log, lease());
+
+    expect((await store.byId('funding-1'))?.status).toBe('unobserved');
+    expect(
+      lines.some((line) => line.includes('funding-1') && line.includes('deposit address was disclosed')),
+    ).toBe(true);
+    await store.close();
+  });
+
+  it('logs the last known status, not a disclosure, when no address was ever shown', async () => {
+    const { store } = tracking([inFlight()]);
+    const { lines, log } = notes();
+
+    await tick(store, NOW + MAX_AGE + 1, observations(async () => undefined), MAX_AGE, log, lease());
+
+    expect((await store.byId('funding-1'))?.status).toBe('unobserved');
+    const line = lines.find((entry) => entry.includes('funding-1'));
+    expect(line).toContain('PENDING');
+    expect(line).not.toContain('deposit address was disclosed');
     await store.close();
   });
 });
