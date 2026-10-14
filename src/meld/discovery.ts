@@ -43,6 +43,7 @@
 import { z } from 'zod';
 
 import type { Direction } from '../rail.js';
+import { toMeldCode } from './catalog.js';
 
 /** The category each direction reads under. Off-ramp is `CRYPTO_OFFRAMP`, verified live. */
 const CATEGORY: Record<Direction, string> = { buy: 'CRYPTO_ONRAMP', sell: 'CRYPTO_OFFRAMP' };
@@ -57,7 +58,8 @@ const CATEGORY: Record<Direction, string> = { buy: 'CRYPTO_ONRAMP', sell: 'CRYPT
  * See the module header for why the swap matters and how it is verified.
  */
 function routesPath(direction: Direction, country: string, fiat: string, crypto: string): string {
-  const [source, destination] = direction === 'sell' ? [crypto, fiat] : [fiat, crypto];
+  const meldCrypto = toMeldCode(crypto);
+  const [source, destination] = direction === 'sell' ? [meldCrypto, fiat] : [fiat, meldCrypto];
   return (
     `/network-partner/supported/routes/${CATEGORY[direction]}/${encodeURIComponent(country)}` +
     `/${encodeURIComponent(source)}/${encodeURIComponent(destination)}`

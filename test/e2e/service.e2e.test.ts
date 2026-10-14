@@ -68,13 +68,13 @@ let started = false;
 let meldCalls: string[] = [];
 
 /**
- * The asset codes this deployment delivers, as Meld would classify them.
+ * The asset codes this deployment delivers, under the names Meld uses for them now.
  *
  * The fake needs to tell a crypto code from a fiat one because that, and nothing else, is how
  * Meld decides which direction a quote or a session is (verified). A list rather than a pattern:
  * `DOT` and `BTC` are three letters, so no shape test separates them from `USD`.
  */
-const CRYPTO_CODES = ['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB'];
+const CRYPTO_CODES = ['USDC_DOT', 'USDT_DOT', 'DOT'];
 const isCrypto = (code: unknown): boolean => typeof code === 'string' && CRYPTO_CODES.includes(code);
 
 /** The request body as JSON, or an empty object for a GET. */
@@ -260,7 +260,7 @@ async function fakeMeld(
                 sourceAmount: '25.00',
                 sourceCurrencyCode: 'USD',
                 destinationAmount: '24',
-                destinationCurrencyCode: 'USDC_ASSETHUB',
+                destinationCurrencyCode: 'USDC_DOT',
                 totalFee: '1.00',
               },
             ],
@@ -844,12 +844,12 @@ describe('the funding journey over real HTTP', () => {
     // Name-sorted, as `countries` returns and the catalog preserves; buy's job runs before sell's
     // (`SUPPORTED_REFRESH_JOBS`' order), and each direction's route path has its own argument order.
     expect(discovery.filter((url) => url.includes('/supported/routes/'))).toEqual([
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT_ASSETHUB',
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT_ASSETHUB',
-      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB',
-      '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT_ASSETHUB/BRL',
-      '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT_ASSETHUB/ZZZ',
-      '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT_ASSETHUB/USD',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/BR/BRL/DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/ZZ/ZZZ/DOT',
+      '/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/BR/DOT/BRL',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/ZZ/DOT/ZZZ',
+      '/network-partner/supported/routes/CRYPTO_OFFRAMP/US/DOT/USD',
     ]);
 
     // And the endpoint serves those rows without going to Meld.

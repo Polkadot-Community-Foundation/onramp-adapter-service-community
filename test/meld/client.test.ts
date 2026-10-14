@@ -165,7 +165,7 @@ describe('createWidgetSession', () => {
     expect(body).toEqual({
       sessionType: 'BUY',
       sessionData: {
-        destinationCurrencyCode: 'USDC_ASSETHUB',
+        destinationCurrencyCode: 'USDC_DOT',
         walletAddress: '1abc',
         sourceAmount: '25.00',
         sourceCurrencyCode: 'USD',
@@ -204,7 +204,7 @@ describe('createWidgetSession', () => {
     expect(JSON.parse(sentInit(fetchMock).body as string)).toEqual({
       sessionType: 'SELL',
       sessionData: {
-        sourceCurrencyCode: 'DOT_ASSETHUB',
+        sourceCurrencyCode: 'DOT',
         destinationCurrencyCode: 'GBP',
         sourceAmount: '12.3456789012',
         countryCode: 'GB',
@@ -549,10 +549,27 @@ describe('quote', () => {
     expect(sentBody(fetchMock)).toEqual({
       countryCode: 'US',
       sourceCurrencyCode: 'USD',
-      destinationCurrencyCode: 'USDC_ASSETHUB',
+      destinationCurrencyCode: 'USDC_DOT',
       sourceAmount: '20',
       paymentMethodType: 'CREDIT_DEBIT_CARD',
     });
+  });
+
+  it("reads Meld's codes in an offer back as this service's", async () => {
+    stub(200, {
+      quotes: [
+        {
+          serviceProvider: 'P',
+          sourceAmount: '20',
+          sourceCurrencyCode: 'USD',
+          destinationAmount: '19',
+          destinationCurrencyCode: 'USDC_DOT',
+        },
+      ],
+    });
+
+    const [offer] = await client().quote(probe());
+    expect(offer).toMatchObject({ sourceCurrencyCode: 'USD', destinationCurrencyCode: 'USDC_ASSETHUB' });
   });
 
   it('prices a sell on the same endpoint, with the crypto as the source leg', async () => {
@@ -566,7 +583,7 @@ describe('quote', () => {
 
     expect(sentBody(fetchMock)).toEqual({
       countryCode: 'GB',
-      sourceCurrencyCode: 'DOT_ASSETHUB',
+      sourceCurrencyCode: 'DOT',
       destinationCurrencyCode: 'GBP',
       // `sourceAmount`, still mandatory, and crypto-denominated: a sell quote answers "what does
       // this much crypto fetch", never "how much must I sell to receive 500".
