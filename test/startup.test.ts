@@ -20,11 +20,12 @@ import { upstreamUnavailable } from '../src/contract.js';
 import type { Config } from '../src/config.js';
 import { config, createRequest, fakeSocket, fundingRecord, personhoodConfig, rawConfig, withSocket } from './fixtures.js';
 
-/** Just the two levels `verifyKey` uses, so a plain object substitutes for pino. */
+/** Just the levels `verifyKey` uses, so a plain object substitutes for pino. */
 const recorder = () => {
+  const error = vi.fn();
   const warn = vi.fn();
   const info = vi.fn();
-  return { warn, info, log: { warn, info } as unknown as FastifyBaseLogger };
+  return { error, warn, info, log: { error, warn, info } as unknown as FastifyBaseLogger };
 };
 
 describe('verifyKey', () => {
@@ -32,11 +33,38 @@ describe('verifyKey', () => {
     // Any answer means the request arrived and was rejected: a wrong key, a wrong path, wrong
     // parameters. None of those improve on their own, so serving buyers would be worse than
     // refusing to start.
-    const { log, warn } = recorder();
-    const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(401)) };
+    const { log, warn, error } = recorder();
+    const meld = {
+      verifyCredentials: () => Promise.reject(new MeldHttpError(401, 'UNAUTHORIZED', 'Invalid API key')),
+    };
 
     await expect(verifyKey(meld, config(), log)).rejects.toBeInstanceOf(MeldHttpError);
     expect(warn).not.toHaveBeenCalled();
+    // The process exit prints only the status; the log line is where the operator reads Meld's code.
+    expect(error).toHaveBeenCalledWith(
+      { probe: 'USD->USDC_ASSETHUB in US', status: 401, code: 'UNAUTHORIZED', detail: 'Invalid API key' },
+      'Meld refused the boot probe.',
+    );
+  });
+
+  it('stops the process on a 400 that is not the no-offers answer', async () => {
+    const { log, warn } = recorder();
+    const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(400, 'INVALID_AMOUNT_TOO_LOW')) };
+
+    await expect(verifyKey(meld, config(), log)).rejects.toBeInstanceOf(MeldHttpError);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('warns and continues when Meld answers 400 NO_VALID_QUOTES', async () => {
+    // Meld answers a corridor with no provider this way rather than with an empty list. The key
+    // is proven all the same.
+    const { log, warn, error } = recorder();
+    const meld = { verifyCredentials: () => Promise.reject(new MeldHttpError(400, 'NO_VALID_QUOTES')) };
+
+    await expect(verifyKey(meld, config(), log)).resolves.toBeUndefined();
+    expect(warn.mock.calls[0]?.[1]).toMatch(/offered no quotes/i);
+    expect(warn.mock.calls[0]?.[0]).toMatchObject({ probe: 'USD->USDC_ASSETHUB in US' });
+    expect(error).not.toHaveBeenCalled();
   });
 
   it('warns and continues when Meld cannot be reached', async () => {
