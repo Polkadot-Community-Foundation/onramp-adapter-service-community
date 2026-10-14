@@ -28,7 +28,7 @@ const DEFAULTS: Record<string, unknown> = {
 };
 // on-ramp routes keyed `${country}/${fiat}/${crypto}` (source=fiat, destination=crypto).
 const ROUTES: Record<string, unknown> = {
-  'US/USD/DOT_ASSETHUB': [
+  'US/USD/DOT': [
     {
       partner: 'TRANSAK',
       paymentMethods: [
@@ -52,7 +52,7 @@ const ROUTES: Record<string, unknown> = {
       ],
     },
   ],
-  'CA/CAD/DOT_ASSETHUB': [
+  'CA/CAD/DOT': [
     {
       partner: 'TRANSAK',
       paymentMethods: [
@@ -60,8 +60,8 @@ const ROUTES: Record<string, unknown> = {
       ],
     },
   ],
-  'IN/INR/DOT_ASSETHUB': [],
-  'MX/MXN/DOT_ASSETHUB': [
+  'IN/INR/DOT': [],
+  'MX/MXN/DOT': [
     {
       partner: 'TRANSAK',
       paymentMethods: [
@@ -72,7 +72,7 @@ const ROUTES: Record<string, unknown> = {
     },
   ],
   // USDC is served in fewer places than DOT: the point of the cross-crypto cache test.
-  'US/USD/USDC_ASSETHUB': [
+  'US/USD/USDC_DOT': [
     {
       partner: 'TRANSAK',
       paymentMethods: [
@@ -80,8 +80,8 @@ const ROUTES: Record<string, unknown> = {
       ],
     },
   ],
-  'CA/CAD/USDC_ASSETHUB': [],
-  'IN/INR/USDC_ASSETHUB': [],
+  'CA/CAD/USDC_DOT': [],
+  'IN/INR/USDC_DOT': [],
 };
 // off-ramp routes keyed `${country}/${crypto}/${fiat}` (source=crypto, destination=fiat): the
 // swapped order §5 of the probe verified live.
@@ -172,7 +172,7 @@ describe('MeldDiscovery direction: category and route argument order', () => {
     const get = stubGet();
     const d = new MeldDiscovery(get, ttls(3_600_000));
     await d.corridor('US', 'USD', 'DOT_ASSETHUB', 'buy');
-    expect(get).toHaveBeenCalledWith('/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT_ASSETHUB');
+    expect(get).toHaveBeenCalledWith('/network-partner/supported/routes/CRYPTO_ONRAMP/US/USD/DOT');
   });
 
   it('reads a sell corridor at .../CRYPTO_OFFRAMP/{country}/{crypto}/{fiat} -- the swapped order', async () => {
