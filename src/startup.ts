@@ -300,15 +300,17 @@ export async function start(
  *
  * Three outcomes, and the split between them is the design:
  *
- *   Meld answered with an error status: fatal. Any answer means the request arrived and
- *     was rejected: a wrong key, a wrong endpoint path, wrong parameters. None improve on their
- *     own, so the process stops rather than serving buyers with a credential that cannot work.
+ *   Meld answered with an error status: fatal, and logged with Meld's code. Any answer means the
+ *     request arrived and was rejected: a wrong key, a wrong endpoint path, wrong parameters. None
+ *     improve on their own, so the process stops rather than serving buyers with a credential that
+ *     cannot work. `400 NO_VALID_QUOTES` is the exception: it is Meld's no-offers answer.
  *   Meld could not be reached: warn and continue. A transport failure says nothing about
  *     the configuration, and a transient Meld outage must not block a rollout.
- *   Meld answered, with no offers: warn and continue. It accepted the credential and understood
- *     the request, which is what this probe exists to prove. Zero offers is ambiguous between a
- *     corridor that is dry right now and a probe configured for a corridor Meld never serves,
- *     and only the second is a fault, so an ambiguous signal must not refuse the rollout.
+ *   Meld answered, with no offers (an empty list or `400 NO_VALID_QUOTES`): warn and continue.
+ *     It accepted the credential and understood the request, which is what this probe exists to
+ *     prove. Zero offers is ambiguous between a corridor that is dry right now and a probe
+ *     configured for a corridor Meld never serves, and only the second is a fault, so an
+ *     ambiguous signal must not refuse the rollout.
  */
 export async function verifyKey(
   meld: Pick<MeldClient, 'verifyCredentials'>,
@@ -316,6 +318,14 @@ export async function verifyKey(
   log: FastifyBaseLogger,
 ): Promise<void> {
   const probe = cfg.meld.boot_probe;
+  const corridor = `${probe.source_currency}->${probe.destination_code} in ${probe.country_code}`;
+  const warnNoOffers = (): void => {
+    log.warn(
+      { probe: corridor },
+      'Meld accepted the credentials but offered no quotes for the boot probe corridor. ' +
+        'The key is proven; the probe corridor may not be one Meld serves.',
+    );
+  };
   try {
     const offers = await meld.verifyCredentials({
       countryCode: probe.country_code,
@@ -326,17 +336,23 @@ export async function verifyKey(
     });
 
     if (offers === 0) {
-      log.warn(
-        { probe: `${probe.source_currency}->${probe.destination_code} in ${probe.country_code}` },
-        'Meld accepted the credentials but offered no quotes for the boot probe corridor. ' +
-          'The key is proven; the probe corridor may not be one Meld serves.',
-      );
+      warnNoOffers();
       return;
     }
 
     log.info({ offers }, 'Meld credentials accepted.');
   } catch (error) {
-    if (error instanceof MeldHttpError) throw error;
+    if (error instanceof MeldHttpError) {
+      if (error.status === 400 && error.code === 'NO_VALID_QUOTES') {
+        warnNoOffers();
+        return;
+      }
+      log.error(
+        { probe: corridor, status: error.status, code: error.code, detail: error.detail },
+        'Meld refused the boot probe.',
+      );
+      throw error;
+    }
     log.warn({ detail: String(error) }, 'Could not reach Meld at boot; the key is unverified.');
   }
 }
