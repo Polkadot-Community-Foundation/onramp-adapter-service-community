@@ -15,6 +15,8 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
 | `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
+| `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
+| `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
 | `POST /session` | `POST /crypto/session/widget` | Returns the widget URL to open, and persists a durable funding request. |
 | `GET /transaction/:id` | `GET /payments/transactions/{id}` | Status, projected onto the five fields this service declares. |
@@ -249,6 +251,53 @@ account-level truth, surfaced honestly, not a defect in this service: `GET /supp
 `GET /supported/corridors` answering "not offered" for a corridor genuinely not offered is the
 whole point of asking live rather than hand-maintaining a list. The day a provider that off-ramps
 these assets is onboarded, the same code starts returning it, without a deploy.
+
+### Offramp lanes
+
+A sell can settle through more than one crypto lane (USDT or DOT on Asset Hub, each under either of
+Meld's codes for it, or a stablecoin sold after a Chainflip swap). `supported.offramp_lanes` lists the lanes in preference order, and the two
+`/supported/offramp*` routes answer "what can a seller in this country use" without the caller
+picking a lane first.
+
+The list is also the gate: a sell `/quote` or `/session` for a code that is not a configured lane is
+refused `400 RegionUnavailable` before any rail call. Taking the Chainflip swap lanes out of the list
+therefore turns the swap route off for every client, and a country only they routed answers with no
+payout method.
+
+Merge rule, per country: the set of countries is the union across lanes. For each
+`paymentMethodType`, the method lists **every** configured lane (in configuration order) whose corridor
+offers it, as `lanes: [{code, chain, min, max, currency}]`, each with that lane's own limits. The method's
+own `min` is the smallest lane `min` and its `max` the largest lane `max` (compared as exact decimals, the
+original text is returned), and its `currency` is the country fiat. `name` and `fiat` come from the first
+lane that has the country. Methods are ordered by first sight across lanes in configuration order. A client
+picks a lane from `lanes` and checks the amount against that lane's limits.
+
+```json
+{
+  "paymentMethodType": "PIX",
+  "category": "bank",
+  "min": "5",
+  "max": "5000",
+  "currency": "BRL",
+  "lanes": [
+    { "code": "DOT_ASSETHUB", "chain": "assethub", "min": "10", "max": "3000", "currency": "BRL" },
+    { "code": "USDC_ARBITRUM", "chain": "arbitrum", "min": "5", "max": "5000", "currency": "BRL" }
+  ]
+}
+```
+
+`GET /supported/offramp/corridors` is ordered by name then country, from the same cache and staleness
+rule as `GET /supported/corridors` except that sell rows age out after three *sell* routes passes (`supported.sell_routes_interval_ms`, 12h by default) rather than three buy passes; `GET /supported/offramp` asks Meld live, one `corridorForCountry`
+per lane in sell direction.
+
+The sell-only codes `USDT_SOLANA`, `USDC_SOLANA`, `USDC_ARBITRUM`, `DOT_STATEMINT` and `USDT_STATEMINT` are
+accepted wherever `direction=sell` is, and refused with `WrongAssetOrChain` on every buy path. `DOT_STATEMINT`
+and `USDT_STATEMINT` are Meld's older codes for DOT and USDT on Polkadot Asset Hub (Statemint was Asset Hub's
+name), which some providers, Onramp Money among them, buy only under those codes. The disclosed deposit address is validated per code: a
+`*_SOLANA` sell discloses a base58 32-byte address, stored and compared exactly as given (case-sensitive), not
+SS58-normalised; `USDC_ARBITRUM` discloses an EVM address (`0x` plus 40 hex), stored lowercased so comparisons are
+case-insensitive; the `*_STATEMINT` codes disclose an Asset Hub address, SS58-normalised like `DOT_ASSETHUB`. Anything
+else for that code is recorded as malformed and never disclosed.
 
 ## `POST /quote`
 
@@ -628,7 +677,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 409 | `Other{ REQUEST_CONCLUDED }` | The key belongs to a request that ended as `expired` or `failed`. On a buy the rail answered and nothing was paid; start a new one with a new key. On a sell, `failed` can follow a deposit the seller already sent (the provider failed or refunded the payout), so this is not a promise that nothing left the seller: read the request before opening another sale for the same funds. (`refused` shares this code but never reaches the path: a refused row holds no key.) |
 | 409 | `Other{ REQUEST_ALREADY_SETTLED }` | The key belongs to a request the buyer **already paid**. Do not start another for it. Split out of `REQUEST_CONCLUDED` because a client cannot act on one code for both: told "start a new one" after a settled purchase, it opens a second payable surface for money already taken. |
 | 409 | `Other{ REQUEST_OUTCOME_UNKNOWN }` | The key belongs to a request that concluded as `unobserved`: we stopped being able to ask the rail and never learned whether the buyer paid. Distinct from **both** other 409 conclusions: `REQUEST_CONCLUDED` says it finished and nothing was paid, `REQUEST_ALREADY_SETTLED` says it finished and *was* paid, this one says nobody knows which. Starting a new request means accepting the risk of paying twice. |
-| 400 | `RegionUnavailable` | A real destination this deployment has not configured. |
+| 400 | `RegionUnavailable` | A real destination this deployment has not configured, or a sell of a code that is not one of `supported.offramp_lanes`. |
 | 400 | `BelowMinimum` / `AboveMaximum` | On a **buy**, outside the effective fiat bounds (Meld's live corridor bound, tightened by a `limits` row when one names that pair), carrying `value: { amount, currency }` in fiat. On a **sell**, the provider's own crypto-denominated bound, refused upstream and carrying **no** `value`; see `direction` above for why a crypto threshold is not put on the wire. |
 | 400 | `Other{ CORRIDOR_UNAVAILABLE }` | A configured `limits` row does not overlap the live corridor bound, so this deployment cannot serve the corridor within its own limits. Refused rather than widened to the upstream bound. |
 | 400 | `Other{ INVALID_ADDRESS }` | Address failed to decode, or is not a 32-byte account. |

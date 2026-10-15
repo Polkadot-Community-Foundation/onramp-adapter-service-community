@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { MeldHttpError } from '../../src/meld/client.js';
 import { MeldDiscovery, toCorridorDto } from '../../src/meld/discovery.js';
 
 /** One lifetime for all three endpoints, which is what these tests assumed before the split. */
@@ -297,6 +298,22 @@ describe('MeldDiscovery.defaultFiat for sell: the fiat-limits substitute', () =>
     await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
     await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
     expect(calls).toBe(2);
+  });
+
+  it('skips rows with a null or empty currency', async () => {
+    const d = new MeldDiscovery(
+      async () => ({
+        fiatLimits: [
+          { countryCode: 'GB', currencyCode: null },
+          { countryCode: 'GB', currencyCode: '' },
+          { countryCode: 'GB', currencyCode: 'GBP' },
+          { countryCode: 'ZZ', currencyCode: null },
+        ],
+      }),
+      ttls(3_600_000),
+    );
+    expect(await d.defaultFiat('GB', 'sell')).toBe('GBP');
+    expect(await d.defaultFiat('ZZ', 'sell')).toBe('');
   });
 
   it('throws on an unparseable fiat-limits body, and caches nothing', async () => {
@@ -727,5 +744,73 @@ describe('toCorridorDto', () => {
       methods: [{ paymentMethodType: 'CREDIT_DEBIT_CARD', category: 'card', min: '5', max: '3000', currency: 'USD' }],
     });
     expect(dto.methods[0]).not.toHaveProperty('providers');
+  });
+});
+
+describe('MeldDiscovery.defaultFiat for sell: a country listing several currencies', () => {
+  /**
+   * fiat-limits lists a country once per payout currency, and the first is often not the
+   * country's own (GB: EUR before GBP). A corridor built on that quotes nothing, so the country's
+   * buy default is preferred when it is listed.
+   */
+  const several = (defaults: (path: string) => unknown) =>
+    vi.fn(async (path: string): Promise<unknown> => {
+      if (path.includes('/fiat-limits')) {
+        return {
+          fiatLimits: [
+            { countryCode: 'GB', currencyCode: 'EUR' },
+            { countryCode: 'GB', currencyCode: 'EUR' },
+            { countryCode: 'GB', currencyCode: 'GBP' },
+            { countryCode: 'BR', currencyCode: 'USD' },
+            { countryCode: 'BR', currencyCode: 'EUR' },
+            { countryCode: null, currencyCode: 'GBP' },
+          ],
+        };
+      }
+      if (path.includes('/defaults/')) return defaults(path);
+      return [];
+    });
+
+  it("takes the country's own currency when it is among those listed", async () => {
+    const get = several(() => ({ currencyCode: 'GBP' }));
+    const d = new MeldDiscovery(get, ttls(3_600_000));
+    expect(await d.defaultFiat('GB', 'sell')).toBe('GBP');
+    expect(get).toHaveBeenCalledWith('/network-partner/defaults/GB/CRYPTO_ONRAMP');
+    expect(get.mock.calls.some(([p]) => p.includes('CRYPTO_OFFRAMP') && p.includes('/defaults/'))).toBe(false);
+  });
+
+  it('falls back to the first listed when its own currency is not offered there', async () => {
+    const d = new MeldDiscovery(several(() => ({ currencyCode: 'BRL' })), ttls(3_600_000));
+    expect(await d.defaultFiat('BR', 'sell')).toBe('USD');
+  });
+
+  it('throws, not pinning the first listed, when the buy default cannot be read', async () => {
+    const d = new MeldDiscovery(
+      several(() => {
+        throw new Error('meld down');
+      }),
+      ttls(3_600_000),
+    );
+    await expect(d.defaultFiat('GB', 'sell')).rejects.toThrow('meld down');
+  });
+
+  it('falls back to the first listed when Meld has no buy default for the country (404)', async () => {
+    const d = new MeldDiscovery(
+      several(() => {
+        throw new MeldHttpError(404);
+      }),
+      ttls(3_600_000),
+    );
+    expect(await d.defaultFiat('BR', 'sell')).toBe('USD');
+  });
+
+  it('still throws on a 5xx from the buy default, so the refresh keeps the last known entry', async () => {
+    const d = new MeldDiscovery(
+      several(() => {
+        throw new MeldHttpError(503);
+      }),
+      ttls(3_600_000),
+    );
+    await expect(d.defaultFiat('BR', 'sell')).rejects.toBeInstanceOf(MeldHttpError);
   });
 });

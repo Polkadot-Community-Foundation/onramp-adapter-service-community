@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises';
 import { compile } from '@fastify/proxy-addr';
 import { z } from 'zod';
 
-import { DESTINATIONS } from './meld/catalog.js';
+import { DESTINATIONS, chainOf, isSellable } from './meld/catalog.js';
 import { MINOR_UNIT_DECIMAL, toMinorUnits } from './money.js';
 
 /** Shared so the refinement below can re-test it; see the guard in `limit`. */
@@ -547,6 +547,45 @@ const configSchema = z
           .min(60_000)
           .max(86_400_000)
           .default(2 * 3_600_000),
+        /** Routes pass for sell jobs; slower than buy. Staleness window: three of these. */
+        sell_routes_interval_ms: z
+          .number()
+          .int()
+          .min(60_000)
+          .max(7 * 86_400_000)
+          .default(12 * 3_600_000),
+        /**
+         * Sell lanes behind `GET /supported/offramp*`, in preference order. Codes must be sellable
+         * (Meld resolves a typo to Bitcoin) and `chain` must match the code.
+         */
+        offramp_lanes: z
+          .array(z.object({ code: z.string().min(1), chain: z.string().min(1) }).strict())
+          .min(1)
+          .default([{ code: 'DOT_ASSETHUB', chain: 'assethub' }])
+          .superRefine((lanes, ctx) => {
+            const seen = new Set<string>();
+            lanes.forEach((lane, index) => {
+              if (!isSellable(lane.code)) {
+                ctx.addIssue({
+                  code: 'custom',
+                  path: [index, 'code'],
+                  message: `Unknown offramp lane code "${lane.code}". Adding a code is a code change.`,
+                });
+              }
+              const expected = chainOf(lane.code);
+              if (expected !== undefined && expected !== lane.chain) {
+                ctx.addIssue({
+                  code: 'custom',
+                  path: [index, 'chain'],
+                  message: `Offramp lane "${lane.code}" is on chain "${expected}", not "${lane.chain}".`,
+                });
+              }
+              if (seen.has(lane.code)) {
+                ctx.addIssue({ code: 'custom', path: [index, 'code'], message: `Duplicate offramp lane code "${lane.code}".` });
+              }
+              seen.add(lane.code);
+            });
+          }),
       })
       .strict()
       // `.prefault({})` like `cors`/`rate_limit`: an absent block is the documented defaults.
@@ -576,6 +615,7 @@ const configSchema = z
     renewable(cfg.meld.countries_cache_ttl_ms, 'countries_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
     renewable(cfg.meld.defaults_cache_ttl_ms, 'defaults_cache_ttl_ms', cfg.supported.catalog_interval_ms, 'catalog_interval_ms');
     renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.routes_interval_ms, 'routes_interval_ms');
+    renewable(cfg.meld.routes_cache_ttl_ms, 'routes_cache_ttl_ms', cfg.supported.sell_routes_interval_ms, 'sell_routes_interval_ms');
 
     /**
      * Parse a URL that a field-level `z.url()` has already looked at, or give up quietly.

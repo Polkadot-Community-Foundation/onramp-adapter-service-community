@@ -33,19 +33,20 @@ import { buildServer } from './server.js';
 const SUPPORTED_REFRESH_CRYPTOS = ['DOT_ASSETHUB'];
 
 /**
- * Every (crypto, direction) the refresh walks: both directions for each configured crypto.
- *
- * A crypto sellable here is not necessarily one Meld actually routes for this account -- the
- * probe found no provider on the sandbox account off-ramps any `*_ASSETHUB` asset at all, so a
- * `sell` job for `DOT_ASSETHUB` legitimately writes nothing until a provider that does exists.
- * That is a fact about Meld's current onboarding, not a reason to leave the job unwired: the
- * refresh's whole design (upsert-only, ages out on staleness) already treats "nothing to write"
- * as an ordinary outcome, not a failure, and the day a provider does off-ramp the asset this job
- * starts producing rows with no code change.
+ * Every job the refresh walks: both directions for each configured crypto, plus a sell job per
+ * offramp lane. A job that finds no provider writes nothing, which is not a failure.
  */
-const SUPPORTED_REFRESH_JOBS: readonly RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
-  DIRECTIONS.map((direction) => ({ crypto, direction })),
-);
+export function refreshJobs(lanes: readonly { code: string }[]): RefreshJob[] {
+  const jobs: RefreshJob[] = SUPPORTED_REFRESH_CRYPTOS.flatMap((crypto) =>
+    DIRECTIONS.map((direction) => ({ crypto, direction })),
+  );
+  for (const { code } of lanes) {
+    if (!jobs.some((j) => j.crypto === code && j.direction === 'sell')) {
+      jobs.push({ crypto: code, direction: 'sell' });
+    }
+  }
+  return jobs;
+}
 
 /** A listening service, and the one call that takes it down. */
 interface ServerHandle {
@@ -252,8 +253,12 @@ export async function start(
       ? startSupportedRefresh(
           discovery,
           funding,
-          SUPPORTED_REFRESH_JOBS,
-          { catalogMs: cfg.supported.catalog_interval_ms, routesMs: cfg.supported.routes_interval_ms },
+          refreshJobs(cfg.supported.offramp_lanes),
+          {
+            catalogMs: cfg.supported.catalog_interval_ms,
+            routesMs: cfg.supported.routes_interval_ms,
+            sellRoutesMs: cfg.supported.sell_routes_interval_ms,
+          },
           // warn, not info: a silently staling cache must reach an operator filtering to warn.
           (message) => {
             server.log.warn(message);

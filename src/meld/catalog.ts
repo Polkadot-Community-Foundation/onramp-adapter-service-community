@@ -8,6 +8,7 @@
  */
 
 import { reject } from '../contract.js';
+import type { Direction } from '../rail.js';
 
 interface Destination {
   /** Meld's currency code. The chain is encoded here; there is no separate parameter. */
@@ -22,22 +23,48 @@ export const DESTINATIONS: readonly Destination[] = Object.freeze([
 ]);
 
 /**
- * Is this one of the crypto codes this service delivers?
- *
- * The predicate behind `resolveDestination`, exposed separately because one caller needs the
- * question answered without the refusal attached: `client.ts` checks, before every quote and
- * every session, that the leg holding a crypto is the leg the direction says should hold it.
- * That is a consistency check on this service's own mapping, not a judgement about a caller's
- * request, so it must not raise a caller-facing `WrongAssetOrChain`.
- *
- * "Crypto" here means "crypto this deployment delivers", which is narrower than Meld's notion of
- * one. That is the right test for that purpose and the wrong one for any other: a code outside
- * this list is refused by `resolveDestination` long before a rail is called, so by the time the
- * client asks, the only codes in play are these three and fiat. It is not a general crypto/fiat
- * classifier and must not be used as one — `BTC` is a crypto and is not in it.
+ * Codes a seller may sell and a buyer may never receive: Chainflip-swapped Solana/Arbitrum codes,
+ * and Meld's older `*_STATEMINT` names for Asset Hub. Code, not configuration (T4).
  */
-export function isDeliveredCrypto(code: string): boolean {
-  return DESTINATIONS.some((d) => d.code === code);
+export const OFFRAMP_ONLY: readonly Destination[] = Object.freeze([
+  Object.freeze({ code: 'USDT_SOLANA' }),
+  Object.freeze({ code: 'USDC_SOLANA' }),
+  Object.freeze({ code: 'USDC_ARBITRUM' }),
+  Object.freeze({ code: 'DOT_STATEMINT' }),
+  Object.freeze({ code: 'USDT_STATEMINT' }),
+]);
+
+/** Every code a sell may name: delivered plus sell-only. */
+const SELLABLE: readonly Destination[] = Object.freeze([...DESTINATIONS, ...OFFRAMP_ONLY]);
+
+/** The chain a code settles on, from its suffix; `undefined` for a code with no known chain. */
+export function chainOf(code: string): string | undefined {
+  if (code.endsWith('_ASSETHUB') || code.endsWith('_STATEMINT')) return 'assethub';
+  if (code.endsWith('_SOLANA')) return 'solana';
+  if (code.endsWith('_ARBITRUM')) return 'arbitrum';
+  return undefined;
+}
+
+/** Is this a code that is sellable but never deliverable? */
+export function isOfframpOnly(code: string): boolean {
+  return OFFRAMP_ONLY.some((d) => d.code === code);
+}
+
+/** Every code a sell may name: what is delivered plus what is sell-only. */
+export function isSellable(code: string): boolean {
+  return SELLABLE.some((d) => d.code === code);
+}
+
+/**
+ * Is this a crypto code this service knows (delivered or sell-only)?
+ *
+ * The predicate behind `resolveDestination`, without the refusal: `client.ts` checks before every
+ * quote and session that the leg holding a crypto is the one the direction says should hold it, a
+ * consistency check on this service's own mapping, not a judgement on a caller's request. Not a
+ * general crypto/fiat classifier: `BTC` is a crypto and is not in it.
+ */
+export function isKnownCrypto(code: string): boolean {
+  return isSellable(code);
 }
 
 /** Resolve a code, or refuse it as `WrongAssetOrChain`: it settles somewhere unserved. */
@@ -47,4 +74,21 @@ export function resolveDestination(code: string): Destination {
     throw reject({ tag: 'WrongAssetOrChain' }, `Unknown destination code "${code}".`);
   }
   return found;
+}
+
+/**
+ * Resolve a code for a sell: delivered codes plus the sell-only ones. A buy must keep using
+ * `resolveDestination`, which refuses the sell-only codes.
+ */
+export function resolveSellCode(code: string): Destination {
+  const found = SELLABLE.find((d) => d.code === code);
+  if (!found) {
+    throw reject({ tag: 'WrongAssetOrChain' }, `Unknown destination code "${code}".`);
+  }
+  return found;
+}
+
+/** Resolve a code for the given direction. */
+export function resolveForDirection(code: string, direction: Direction): Destination {
+  return direction === 'sell' ? resolveSellCode(code) : resolveDestination(code);
 }
