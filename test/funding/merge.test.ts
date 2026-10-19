@@ -23,7 +23,7 @@ const inFlight = () =>
 const deposit = (overrides: Partial<RailDeposit> = {}): RailDeposit => ({
   address: ALICE,
   amount: '12.3456789012',
-  currency: 'DOT_ASSETHUB',
+  currency: 'DOT',
   ...overrides,
 });
 
@@ -35,7 +35,7 @@ describe('mergeAdvance: the deposit disclosure', () => {
 
     expect(next.deposit_address).toBe(ALICE);
     expect(next.deposit_amount).toBe('12.3456789012');
-    expect(next.deposit_currency).toBe('DOT_ASSETHUB');
+    expect(next.deposit_currency).toBe('DOT');
     expect(next.deposit_observed_at).toBe(NOW);
     expect(next.status).toBe('transaction_seen');
     expect(next.updated_at).toBe(NOW);
@@ -112,8 +112,8 @@ describe('mergeAdvance: the deposit disclosure', () => {
     // The change is recorded, and from then on the deposit is no longer disclosed.
     const first = mergeAdvance(inFlight(), 'transaction_seen', NOW, { deposit: deposit() });
     for (const [incoming, at] of [
-      [{ address: ALICE_PREFIX_42, amount: '11', currency: 'DOT_ASSETHUB' }, NOW + 1000],
-      [{ address: ALICE, amount: '12.3456789012', currency: 'USDT_ASSETHUB' }, NOW + 2000],
+      [{ address: ALICE_PREFIX_42, amount: '11', currency: 'DOT' }, NOW + 1000],
+      [{ address: ALICE, amount: '12.3456789012', currency: 'USDT_DOT' }, NOW + 2000],
     ] as const) {
       const restated = mergeAdvance(first, 'transaction_seen', at, { deposit: incoming });
       expect(restated).toMatchObject({
@@ -249,5 +249,36 @@ describe('mergeAdvance: the deposit disclosure', () => {
     const buy = fundingRecord({ status: 'transaction_seen', status_history: [{ status: 'transaction_seen', at: 1_700_000_000_000 }] });
     const next = mergeAdvance(buy, 'settled', NOW);
     expect(next.deposit_address).toBeUndefined();
+  });
+});
+
+describe('mergeAdvance: a Solana deposit on a sell-only code', () => {
+  const SOLANA = 'So11111111111111111111111111111111111111112';
+  const OTHER = 'Vote111111111111111111111111111111111111111';
+  const solSell = () => ({ ...inFlight(), destination_currency_code: 'USDT_SOLANA' });
+  const sol = (address: string) => deposit({ address, currency: 'USDT_SOLANA' });
+
+  it('stores the base58 address exactly as disclosed', () => {
+    const next = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(SOLANA) });
+    expect(next.deposit_address).toBe(SOLANA);
+    expect(next.deposit_conflict_reason).toBeUndefined();
+  });
+
+  it('compares exactly: a repeat is quiet, another key or a case change is a conflict', () => {
+    const first = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(SOLANA) });
+    const same = mergeAdvance(first, 'transaction_seen', NOW + 1, { deposit: sol(SOLANA) });
+    expect(same.deposit_conflict_at).toBeUndefined();
+
+    const other = mergeAdvance(first, 'transaction_seen', NOW + 2, { deposit: sol(OTHER) });
+    expect(other.deposit_conflict_reason).toBe('address_changed');
+
+    const cased = mergeAdvance(first, 'transaction_seen', NOW + 3, { deposit: sol(SOLANA.toLowerCase()) });
+    expect(cased.deposit_address).toBe(SOLANA);
+    expect(cased.deposit_conflict_address).toBe(SOLANA.toLowerCase());
+  });
+
+  it('refuses an SS58 address on a Solana row as malformed', () => {
+    const next = mergeAdvance(solSell(), 'transaction_seen', NOW, { deposit: sol(ALICE) });
+    expect(next.deposit_conflict_reason).toBe('address_malformed');
   });
 });

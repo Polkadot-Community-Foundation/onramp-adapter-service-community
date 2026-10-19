@@ -37,7 +37,14 @@ import type {
   RailRegistry,
 } from './rail.js';
 import { DEFAULT_DIRECTION, DEFAULT_RAIL } from './rail.js';
-import { resolveDestination } from './meld/catalog.js';
+import { resolveForDirection } from './meld/catalog.js';
+import {
+  mergeMethods,
+  mergeOfframpCorridors,
+  type LaneCorridor,
+  type OfframpCorridor,
+  type OfframpMethod,
+} from './offramp.js';
 import { toMinorUnits } from './money.js';
 import type { Corridor, CountryRow, Discovery, MethodLimit } from './meld/discovery.js';
 
@@ -172,7 +179,7 @@ export class Onramp {
    *  Refuses an unknown crypto as `WrongAssetOrChain` before any probe. `direction` is absent
    *  means `buy`, exactly as `/quote` and `/session`; see `this.direction`. */
   async supported(country: string, code: string, direction?: Direction): Promise<Corridor> {
-    resolveDestination(code);
+    resolveForDirection(code, this.direction(direction));
     if (this.discovery === undefined) {
       throw reject(
         { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
@@ -188,17 +195,20 @@ export class Onramp {
   // fresh within the last few passes. `direction` absent means `buy`, as everywhere else on this
   // surface.
   async supportedCorridors(code: string, direction?: Direction): Promise<SupportedCorridorDto[]> {
-    resolveDestination(code);
-    // The rows are written by the routes pass, so that is the cadence staleness is measured in.
-    const freshAfter = this.clock() - this.cfg.supported.routes_interval_ms * STALE_PASSES;
-    const rows = await this.funding.readCorridors(code, this.direction(direction), freshAfter);
+    const dir = this.direction(direction);
+    resolveForDirection(code, dir);
+    // The rows are written by the routes pass, so that is the cadence staleness is measured in;
+    // sell jobs run it on their own, slower, interval.
+    const interval = dir === 'sell' ? this.cfg.supported.sell_routes_interval_ms : this.cfg.supported.routes_interval_ms;
+    const freshAfter = this.clock() - interval * STALE_PASSES;
+    const rows = await this.funding.readCorridors(code, dir, freshAfter);
     return rows.map((r) => ({ country: r.country, name: r.name, fiat: r.fiat, methods: r.methods }));
   }
 
   /** The countries this deployment can deliver a crypto to (or take it from, on a sell), for the
    *  region dropdown. `direction` absent means `buy`. */
   async supportedCountries(code: string, direction?: Direction): Promise<CountryRow[]> {
-    resolveDestination(code);
+    resolveForDirection(code, this.direction(direction));
     if (this.discovery === undefined) {
       throw reject(
         { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
@@ -207,6 +217,53 @@ export class Onramp {
       );
     }
     return this.discovery.countries(code, this.direction(direction));
+  }
+
+  /**
+   * Every cached sell corridor across the configured offramp lanes, merged per country: each
+   * payment method lists every lane (in configuration order) that offers it, with that lane's limits.
+   */
+  async offrampCorridors(): Promise<OfframpCorridor[]> {
+    const freshAfter = this.clock() - this.cfg.supported.sell_routes_interval_ms * STALE_PASSES;
+    const rows: LaneCorridor[] = [];
+    for (const lane of this.cfg.supported.offramp_lanes) {
+      for (const r of await this.funding.readCorridors(lane.code, 'sell', freshAfter)) {
+        rows.push({ lane, country: r.country, name: r.name, fiat: r.fiat, methods: r.methods });
+      }
+    }
+    return mergeOfframpCorridors(rows);
+  }
+
+  /** One country's sell methods across the configured lanes, live from discovery. */
+  async offramp(country: string): Promise<{ country: string; fiat: string; methods: OfframpMethod[] }> {
+    if (this.discovery === undefined) {
+      throw reject(
+        { tag: 'Other', value: { code: 'DISCOVERY_UNAVAILABLE', message: 'Capability discovery is not configured.' } },
+        'offramp() called without a discovery client.',
+        503,
+      );
+    }
+    const discovery = this.discovery;
+    // Each lane reads its own route, so one lane's failure (a 429 or a 5xx from Meld) counts as that
+    // lane having no methods rather than failing the whole answer while the others replied. When
+    // every lane fails there is no answer to give, and an empty-but-OK reply would read as "this
+    // country has no sell routes" during a total Meld outage, so the first failure is rethrown.
+    const failures: unknown[] = [];
+    const views: LaneCorridor[] = await Promise.all(
+      this.cfg.supported.offramp_lanes.map(async (lane): Promise<LaneCorridor> => {
+        try {
+          const c = await discovery.corridorForCountry(country, lane.code, 'sell');
+          return { lane, country: c.country, fiat: c.fiat, methods: c.methods };
+        } catch (error) {
+          failures.push(error);
+          return { lane, country, fiat: '', methods: [] };
+        }
+      }),
+    );
+    if (failures.length > 0 && failures.length === views.length) throw failures[0];
+    const fiat = views.find((v) => v.methods.length > 0)?.fiat ?? views.find((v) => v.fiat !== '')?.fiat ?? '';
+    const methods = mergeMethods(views, fiat);
+    return { country, fiat, methods };
   }
 
   /**
@@ -242,7 +299,7 @@ export class Onramp {
    * committed.
    */
   async quote(request: QuoteRequest): Promise<QuoteResponse> {
-    const destination = resolveDestination(request.destinationCurrencyCode);
+    const destination = resolveForDirection(request.destinationCurrencyCode, this.direction(request.direction));
     // Refuse an unservable pair here rather than at the moment of charge. Amount bounds are
     // deliberately not applied at quote time (a quote is exploratory and the buyer is still
     // choosing the number), but whether this deployment serves this currency at all cannot change
@@ -1102,8 +1159,16 @@ export class Onramp {
    * absent or unreachable discovery leaves a sell ungated on both `/quote` and `/session`, which is
    * the pre-existing behaviour (a sell skipped this whole gate before direction-aware discovery
    * existed to check it) rather than a new hole opened by this function.
+   *
+   * One check does not need discovery: the code must be one of `supported.offramp_lanes`. That
+   * list is the deployment's switch for which off-ramp routes exist (the Chainflip swap lanes
+   * among them), so a code taken out of it is refused here as `RegionUnavailable`, before any
+   * rail call, whatever a client asks for.
    */
   private async sellCorridorCheck(code: string, currency: string, country: string, method: string): Promise<void> {
+    if (!this.cfg.supported.offramp_lanes.some((lane) => lane.code === code)) {
+      throw reject({ tag: 'RegionUnavailable' }, `${code} is not a configured offramp lane.`);
+    }
     if (this.discovery === undefined) return;
     await this.corridorMethod(this.discovery, code, currency, country, method, 'sell');
   }
@@ -1140,7 +1205,7 @@ export class Onramp {
     rail: FundingRail,
     direction: Direction,
   ): Promise<Committed> {
-    const destination = resolveDestination(request.destinationCurrencyCode);
+    const destination = resolveForDirection(request.destinationCurrencyCode, direction);
     const currency = request.fiat.toUpperCase();
     // Only a buy has an address to pin. On a sell the schema has already refused one, and the
     // deposit address the seller will use is the provider's, issued after the session exists.

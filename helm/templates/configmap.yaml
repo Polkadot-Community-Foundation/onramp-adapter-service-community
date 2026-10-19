@@ -66,6 +66,7 @@ data:
           "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
         }
       },
+      "assets": {{ toJson .Values.assets }},
       "limits": {{ toJson .Values.limits }},
       "allowed_products": {{ toJson .Values.allowed_products }},
       "cors": {{ toJson (dict "allowed_origins" ((index (.Values.cors | default (dict)) "allowed_origins") | default list)) }},
@@ -92,6 +93,8 @@ data:
       "supported": {
         "enabled": {{ .Values.supported.enabled }},
         "catalog_interval_ms": {{ int .Values.supported.catalog_interval_ms }},
-        "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }}
+        "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }},
+        "sell_routes_interval_ms": {{ int .Values.supported.sell_routes_interval_ms }},
+        "offramp_lanes": {{ .Values.supported.offramp_lanes | toJson }}
       }
     }
