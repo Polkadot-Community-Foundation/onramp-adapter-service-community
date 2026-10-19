@@ -1,65 +1,42 @@
 name: Production image
 
-# Builds the onramp image for production from a PCF release tag on the `production` branch and
-# pushes it to the production registry, tagged with that release tag. It does not deploy.
+# PCF production: a dispatch on `production` builds the onramp image, pushes it to the production
+# registry tagged `production-<YYYY-MM-DD>.<n>` behind the `production` environment approval, then
+# tags the built commit `production/<YYYY-MM-DD>.<n>`. It does not deploy. A dispatch on any other
+# ref is refused.
 #
-# `release.yml` keeps publishing development images from `main` to GHCR; this workflow is the only
-# path to the production registry. The push job runs in the `production` GitHub environment, which
-# requires a reviewer, and its credentials are keyless (GitHub OIDC -> Workload Identity
-# Federation) and only issued to that environment. Registry and identity come from production
-# environment variables, so a missing value fails the run. Registry tags are immutable: a release
-# tag is built once.
+# This workflow is the only path to the production registry. The push job runs in the `production`
+# GitHub environment, which requires a reviewer, and its credentials are keyless (GitHub OIDC ->
+# Workload Identity Federation) and only issued to that environment. Registry and identity come
+# from production environment variables, so a missing value fails the run. Registry tags are
+# immutable.
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Release tag on the production branch
-        required: true
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: production-image-${{ inputs.tag || github.ref_name }}
+  group: production-image
   cancel-in-progress: false
 
 jobs:
-  release-tag:
+  guard:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - id: tag
-        name: Require a tag on the production branch
+      - name: Require the production branch
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          REF: ${{ github.ref }}
         run: |
-          set -euo pipefail
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9A-Za-z._-]{1,127}$'; then
-            echo "::error::Refusing tag $(printf '%q' "$TAG"): not a release tag."
+          if [ "$REF" != "refs/heads/production" ]; then
+            echo "::error::production-image.yml only publishes from refs/heads/production (ref was $REF)"
             exit 1
           fi
-          if ! git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
-            echo "::error::${TAG} is not a tag in this repository"
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "refs/tags/${TAG}^{commit}" origin/production; then
-            echo "::error::${TAG} is not on the production branch"
-            exit 1
-          fi
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-  # The release gate from release.yml, run against the tag's source.
+  # The release gate from release.yml.
   verify:
-    needs: release-tag
+    needs: guard
     name: Verify (release gate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -87,7 +64,7 @@ jobs:
       # what runs in the workflow that deploys to production.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ needs.release-tag.outputs.tag }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
@@ -120,16 +97,18 @@ jobs:
       - run: npm run check:chart
 
   push:
-    needs: [release-tag, verify]
+    needs: [guard, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
     permissions:
       contents: read
       id-token: write
+    outputs:
+      release: ${{ steps.release.outputs.name }}
+      image: ${{ steps.summary.outputs.image }}
     env:
       IMAGE_REPO: ${{ vars.IMAGE_REGISTRY }}/onramp-adapter-service
-      IMAGE_TAG: ${{ needs.release-tag.outputs.tag }}
     steps:
       - name: Require production configuration
         env:
@@ -148,7 +127,18 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ needs.release-tag.outputs.tag }}
+          ref: ${{ github.sha }}
+
+      - id: release
+        name: Release name
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          LAST=$(git ls-remote --tags origin "refs/tags/production/${DATE}.*" \
+            | sed -n "s#.*refs/tags/production/${DATE}\.\([0-9]*\)\$#\1#p" | sort -n | tail -1)
+          NAME="production/${DATE}.$(( ${LAST:-0} + 1 ))"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${NAME/\//-}" >> "$GITHUB_ENV"
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -183,9 +173,11 @@ jobs:
             --set "*.cache-to=type=gha,scope=production,mode=max,ignore-error=true" \
             --push
 
-      - name: Summary
+      - id: summary
+        name: Summary
         run: |
           digest=$(docker buildx imagetools inspect "$IMAGE_REPO:$IMAGE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "image=$IMAGE_REPO:$IMAGE_TAG@$digest" >> "$GITHUB_OUTPUT"
           {
             echo "## Pushed"
             echo
@@ -194,3 +186,26 @@ jobs:
             echo "$IMAGE_REPO@$digest"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    needs: push
+    name: Tag the built commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Tag the built commit
+        env:
+          TAG: ${{ needs.push.outputs.release }}
+          IMAGE: ${{ needs.push.outputs.image }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$GITHUB_SHA" -m "onramp production image $IMAGE, run ${GITHUB_RUN_ID}"
+          git push origin "refs/tags/$TAG"
+          echo "### Tagged \`$TAG\` at ${GITHUB_SHA:0:8}" >> "$GITHUB_STEP_SUMMARY"
