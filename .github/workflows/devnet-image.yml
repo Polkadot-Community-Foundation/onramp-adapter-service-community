@@ -1,15 +1,14 @@
 name: Devnet image
 
-# Builds the onramp image from the `devnet` branch and pushes it to the devnet registry, tagged
-# `YYYYmmdd-HHMMSS-<sha8>`. It does not deploy. Tags are immutable: no moving tag is published.
+# PCF devnet: a dispatch on `devnet` builds the onramp image, pushes it to the devnet registry tagged
+# `devnet-<YYYY-MM-DD>.<n>`, then tags the built commit `devnet/<YYYY-MM-DD>.<n>`. It does not
+# deploy. A dispatch on any other ref is refused.
 #
 # The push job runs in the `devnet` GitHub environment. Credentials are keyless (GitHub OIDC ->
 # Workload Identity Federation) and registry and identity come from devnet environment variables,
-# so a missing value fails the run. `release.yml` only runs on `main` and is unaffected.
+# so a missing value fails the run.
 
 on:
-  push:
-    branches: [devnet]
   workflow_dispatch:
 
 permissions:
@@ -92,6 +91,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      release: ${{ steps.release.outputs.name }}
+      image: ${{ steps.summary.outputs.image }}
     env:
       IMAGE_REPO: ${{ vars.IMAGE_REGISTRY }}/onramp-adapter-service
     steps:
@@ -114,8 +116,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Image tag
-        run: echo "IMAGE_TAG=$(date -u '+%Y%m%d-%H%M%S')-${GITHUB_SHA::8}" >> "$GITHUB_ENV"
+      - id: release
+        name: Release name
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y-%m-%d)
+          LAST=$(git ls-remote --tags origin "refs/tags/devnet/${DATE}.*" \
+            | sed -n "s#.*refs/tags/devnet/${DATE}\.\([0-9]*\)\$#\1#p" | sort -n | tail -1)
+          NAME="devnet/${DATE}.$(( ${LAST:-0} + 1 ))"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${NAME/\//-}" >> "$GITHUB_ENV"
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -150,9 +160,11 @@ jobs:
             --set "*.cache-to=type=gha,scope=devnet,mode=max,ignore-error=true" \
             --push
 
-      - name: Summary
+      - id: summary
+        name: Summary
         run: |
           digest=$(docker buildx imagetools inspect "$IMAGE_REPO:$IMAGE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "image=$IMAGE_REPO:$IMAGE_TAG@$digest" >> "$GITHUB_OUTPUT"
           {
             echo "## Pushed"
             echo
@@ -161,3 +173,26 @@ jobs:
             echo "$IMAGE_REPO@$digest"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  tag:
+    needs: push
+    name: Tag the built commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Tag the built commit
+        env:
+          TAG: ${{ needs.push.outputs.release }}
+          IMAGE: ${{ needs.push.outputs.image }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$GITHUB_SHA" -m "onramp devnet image $IMAGE, run ${GITHUB_RUN_ID}"
+          git push origin "refs/tags/$TAG"
+          echo "### Tagged \`$TAG\` at ${GITHUB_SHA:0:8}" >> "$GITHUB_STEP_SUMMARY"
