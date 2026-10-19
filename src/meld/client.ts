@@ -17,7 +17,7 @@ import { z } from 'zod';
 import { upstreamUnavailable } from '../contract.js';
 import type { Direction } from '../rail.js';
 import type { Secret } from '../secret.js';
-import { fromMeldCode, isDeliveredCrypto, toMeldCode } from './catalog.js';
+import { isDeliveredCrypto } from './catalog.js';
 
 /**
  * Refuse to send a request whose legs contradict its direction.
@@ -455,7 +455,7 @@ export class MeldClient {
     return this.postQuote({
       countryCode: params.countryCode,
       sourceCurrencyCode: params.sourceCurrencyCode,
-      destinationCurrencyCode: toMeldCode(params.destinationCurrencyCode),
+      destinationCurrencyCode: params.destinationCurrencyCode,
       sourceAmount: params.sourceAmount,
       paymentMethodType: params.paymentMethodType,
     });
@@ -483,7 +483,7 @@ export class MeldClient {
     assertLegs('sell', params.cryptoCurrencyCode, params.fiatCurrencyCode);
     return this.postQuote({
       countryCode: params.countryCode,
-      sourceCurrencyCode: toMeldCode(params.cryptoCurrencyCode),
+      sourceCurrencyCode: params.cryptoCurrencyCode,
       destinationCurrencyCode: params.fiatCurrencyCode,
       sourceAmount: params.cryptoAmount,
       paymentMethodType: params.paymentMethodType,
@@ -504,15 +504,7 @@ export class MeldClient {
     const offers = this.read(quoteEnvelope, body, 'quote').quotes ?? [];
     const readable = offers.flatMap((offer) => {
       const parsed = quoteSchema.safeParse(offer);
-      if (!parsed.success) return [];
-      const quote = parsed.data;
-      return [
-        {
-          ...quote,
-          sourceCurrencyCode: fromMeldCode(quote.sourceCurrencyCode),
-          destinationCurrencyCode: fromMeldCode(quote.destinationCurrencyCode),
-        },
-      ];
+      return parsed.success ? [parsed.data] : [];
     });
 
     // Every offer unreadable when there were offers to read is systemic (a changed response
@@ -589,10 +581,10 @@ export class MeldClient {
         // the literal bytes of a buy depend on which branch built it — an invisible change that
         // `toEqual` on a parsed body cannot see, under a claim that buy is byte-identical.
         serviceProvider: params.serviceProvider,
-        destinationCurrencyCode: toMeldCode(legs.destinationCurrencyCode),
+        destinationCurrencyCode: legs.destinationCurrencyCode,
         walletAddress: legs.walletAddress,
         sourceAmount: legs.sourceAmount,
-        sourceCurrencyCode: toMeldCode(legs.sourceCurrencyCode),
+        sourceCurrencyCode: legs.sourceCurrencyCode,
         countryCode: params.countryCode,
         paymentMethodType: params.paymentMethodType,
         // Meld's whole lockable vocabulary is six values, and it names them when you send a

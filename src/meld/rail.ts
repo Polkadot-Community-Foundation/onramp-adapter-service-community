@@ -27,7 +27,6 @@
 
 import type { MeldClient, MeldTransaction } from './client.js';
 import { canonicalizeDisclosedAddress } from '../address.js';
-import { fromMeldCode } from './catalog.js';
 import type { FundingRecord } from '../funding/types.js';
 import type { RailObservation, TransactionMapper } from '../funding/worker.js';
 import type {
@@ -222,7 +221,7 @@ function depositFrom(record: FundingRecord, txn: MeldTransaction): RailDeposit |
   const amount = given(txn.sourceAmount);
   const currency = given(txn.sourceCurrencyCode);
   if (address === undefined || amount === undefined || currency === undefined) return undefined;
-  return { address, amount, currency: fromMeldCode(currency) };
+  return { address, amount, currency };
 }
 
 /** What Meld sent in a field, or `undefined` for one that is missing or blank. */

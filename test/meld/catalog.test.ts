@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { Refusal } from '../../src/contract.js';
-import { DESTINATIONS, fromMeldCode, resolveDestination, toMeldCode } from '../../src/meld/catalog.js';
+import { DESTINATIONS, resolveDestination } from '../../src/meld/catalog.js';
 
 describe('catalog', () => {
   it('offers exactly the three Asset Hub destinations Meld can deliver', () => {
@@ -18,15 +18,8 @@ describe('catalog', () => {
     // Asserted on `code` alone, because that is the only member anything reads. This test used
     // to assert `symbol` and `decimals` (data no production line touched), which is how they
     // survived unnoticed until mutation testing pointed at them.
-    expect(resolveDestination('USDC_ASSETHUB')).toEqual({ code: 'USDC_ASSETHUB', meldCode: 'USDC_DOT' });
-    expect(resolveDestination('DOT_ASSETHUB')).toEqual({ code: 'DOT_ASSETHUB', meldCode: 'DOT' });
-  });
-
-  it("translates each delivered code to Meld's and back, and leaves a fiat alone", () => {
-    expect(['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB'].map(toMeldCode)).toEqual(['USDC_DOT', 'USDT_DOT', 'DOT']);
-    expect(['USDC_DOT', 'USDT_DOT', 'DOT'].map(fromMeldCode)).toEqual(['USDC_ASSETHUB', 'USDT_ASSETHUB', 'DOT_ASSETHUB']);
-    expect(toMeldCode('USD')).toBe('USD');
-    expect(fromMeldCode('GBP')).toBe('GBP');
+    expect(resolveDestination('USDC_ASSETHUB')).toEqual({ code: 'USDC_ASSETHUB' });
+    expect(resolveDestination('DOT_ASSETHUB')).toEqual({ code: 'DOT_ASSETHUB' });
   });
 
   it('refuses an unknown code rather than forwarding it', () => {

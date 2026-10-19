@@ -10,34 +10,16 @@
 import { reject } from '../contract.js';
 
 interface Destination {
-  /** This service's code for the asset, the one callers send and records store. */
+  /** Meld's currency code. The chain is encoded here; there is no separate parameter. */
   readonly code: string;
-  /** Meld's currency code for the same asset, the one sent to and read back from Meld. */
-  readonly meldCode: string;
 }
 
-/**
- * Codes only. A `symbol` and a `decimals` lived here and nothing ever read either.
- *
- * Meld renamed its Asset Hub codes from `*_ASSETHUB` to `DOT`, `USDT_DOT` and `USDC_DOT`, and its
- * catalog lists no route under the old names. The service keeps the old names as its own contract
- * and translates at the Meld boundary, so callers and stored rows are unaffected.
- */
+/** Codes only. A `symbol` and a `decimals` lived here and nothing ever read either. */
 export const DESTINATIONS: readonly Destination[] = Object.freeze([
-  Object.freeze({ code: 'USDC_ASSETHUB', meldCode: 'USDC_DOT' }),
-  Object.freeze({ code: 'USDT_ASSETHUB', meldCode: 'USDT_DOT' }),
-  Object.freeze({ code: 'DOT_ASSETHUB', meldCode: 'DOT' }),
+  Object.freeze({ code: 'USDC_ASSETHUB' }),
+  Object.freeze({ code: 'USDT_ASSETHUB' }),
+  Object.freeze({ code: 'DOT_ASSETHUB' }),
 ]);
-
-/** Meld's code for a delivered asset; any other code (a fiat) is returned unchanged. */
-export function toMeldCode(code: string): string {
-  return DESTINATIONS.find((d) => d.code === code)?.meldCode ?? code;
-}
-
-/** This service's code for a Meld code; any other code (a fiat) is returned unchanged. */
-export function fromMeldCode(meldCode: string): string {
-  return DESTINATIONS.find((d) => d.meldCode === meldCode)?.code ?? meldCode;
-}
 
 /**
  * Is this one of the crypto codes this service delivers?
