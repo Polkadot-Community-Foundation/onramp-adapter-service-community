@@ -32,6 +32,8 @@ import {
   supportedQuery,
   supportedCountriesQuery,
   supportedCorridorsQuery,
+  supportedOfframpCorridorsQuery,
+  supportedOfframpQuery,
   redeemRequest,
   malformedRequest,
   notFound,
@@ -40,6 +42,7 @@ import {
   type ErrorResponse,
   fundingListQuery,
 } from './contract.js';
+import { AssetCatalog } from './meld/catalog.js';
 import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
@@ -54,6 +57,8 @@ type OnrampPort = Pick<
   | 'supported'
   | 'supportedCountries'
   | 'supportedCorridors'
+  | 'offrampCorridors'
+  | 'offramp'
   | 'transaction'
   | 'cancel'
   | 'get'
@@ -287,6 +292,14 @@ export async function buildServer(
    */
   app.get('/health', { logLevel: 'silent' }, async () => ({ status: 'ok' }));
 
+  // What Meld calls each asset this deployment serves, by this service's own name for it. A client
+  // sends these codes on /quote and /session rather than writing its own copy of them, so a Meld
+  // rename is one config edit here and no client release. Static for the life of the process.
+  const assets = new AssetCatalog(cfg.assets)
+    .all()
+    .map(({ asset, code, chain, deliverable }) => ({ asset, code, chain, deliverable }));
+  app.get('/assets', asCaller, async () => ({ assets }));
+
   /** Spends a Meld call but no money, which is why boot uses it as the credential probe. */
   app.post('/quote', asCaller, async (request, reply) =>
     reply.send(await onramp.quote(parse(quoteRequest, request.body))),
@@ -315,6 +328,16 @@ export async function buildServer(
   app.get<{ Querystring: Record<string, string> }>('/supported/corridors', asCaller, async (request, reply) => {
     const q = parse(supportedCorridorsQuery, request.query);
     return reply.send({ corridors: await onramp.supportedCorridors(q.destinationCurrencyCode, q.direction) });
+  });
+
+  // Sell corridors merged across the configured offramp lanes: cached (all countries) and live (one).
+  app.get<{ Querystring: Record<string, string> }>('/supported/offramp/corridors', asCaller, async (request, reply) => {
+    parse(supportedOfframpCorridorsQuery, request.query);
+    return reply.send({ corridors: await onramp.offrampCorridors() });
+  });
+  app.get<{ Querystring: Record<string, string> }>('/supported/offramp', asCaller, async (request, reply) => {
+    const q = parse(supportedOfframpQuery, request.query);
+    return reply.send(await onramp.offramp(q.country));
   });
 
   /** The one operation that leads to a card charge. */
