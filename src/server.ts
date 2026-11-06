@@ -24,6 +24,7 @@ import { z } from 'zod';
 import type { AuditLog } from './audit.js';
 import { callerAuth } from './auth.js';
 import { callerGate } from './caller.js';
+import { publicClientIp } from './client-ip.js';
 import { toOriginMatcher, type Config } from './config.js';
 import type { PersonhoodService } from './personhood.js';
 import {
@@ -43,7 +44,6 @@ import {
   fundingListQuery,
 } from './contract.js';
 import { AssetCatalog } from './meld/catalog.js';
-import { toCorridorDto } from './meld/discovery.js';
 import { toFundingRequestDto } from './funding/types.js';
 import { MeldHttpError } from './meld/client.js';
 import { railRefusal } from './meld/refusal.js';
@@ -222,7 +222,22 @@ export async function buildServer(
   // route-level, so an instance-level limiter would run before the caller is known and every
   // bucket would collapse back to the address. A preflight has no caller to know, so limiting
   // just that method here is both correct and sufficient.
-  const preflightLimit = app.rateLimit();
+  //
+  // Its own counters, not the routes' bucket. A refused preflight never carries the CORS headers
+  // (cors answers after this hook), so the browser reports it as a CORS error and the app never sees
+  // the 429 or its `retry-after`. Sharing the bucket meant preflights spent the allowance and the
+  // first refusal a caller met was often that unreadable one. Apart, a real request runs out first
+  // and its 429 arrives with the headers the app backs off from. Passing options is what gives the
+  // limiter a child store.
+  //
+  // Held to the larger allowance, not the address one. A preflight is never proven (`identify` is
+  // route-level), so it is keyed on the address, while a proven caller's requests count against
+  // `per_person_max`. Capped at `per_address_max`, the preflight would still be the first refusal
+  // in personhood mode, and shared by everyone behind one NAT. The ceiling on log amplification
+  // stays; it just no longer sits below what a real caller is allowed.
+  const preflightLimit = app.rateLimit({
+    max: Math.max(cfg.rate_limit.per_person_max, cfg.rate_limit.per_address_max),
+  });
   app.addHook('onRequest', async function preflightCeiling(request, reply) {
     // `function`, not an arrow: the plugin's hook reads `this` for the Fastify instance.
     if (request.method === 'OPTIONS') await preflightLimit.call(this, request, reply);
@@ -319,9 +334,7 @@ export async function buildServer(
   );
   app.get<{ Querystring: Record<string, string> }>('/supported', asCaller, async (request, reply) => {
     const q = parse(supportedQuery, request.query);
-    // Projected, not forwarded: `providers` is aggregation bookkeeping no client reads, and
-    // serialising it would name Meld's sub-providers on a surface that deliberately never does.
-    return reply.send(toCorridorDto(await onramp.supported(q.country, q.destinationCurrencyCode, q.direction)));
+    return reply.send(await onramp.supported(q.country, q.destinationCurrencyCode, q.direction));
   });
 
   // Every supported corridor for a crypto in one payload, read from the DB the refresh fills (off Meld).
@@ -344,7 +357,9 @@ export async function buildServer(
   app.post('/session', asCaller, async (request, reply) => {
     const subject = gate.subjectOf(request);
     const body = parse(createSessionRequest, request.body);
-    return reply.code(201).send(await onramp.createSession(subject, body, request.id));
+    return reply
+      .code(201)
+      .send(await onramp.createSession(subject, body, request.id, publicClientIp(request.ip)));
   });
 
   /**
@@ -363,10 +378,10 @@ export async function buildServer(
    * The personhood handshake. Public (no subject yet) and cheap; the rate limit already bounds
    * them per address.
    *
-   * `challenge` mints a fresh blind token; `redeem` turns a ring-VRF proof plus that challenge
-   * into a short-lived JWT, proving the caller is currently in the People ring this deployment
-   * serves. In `insecure_dev` these routes do not exist: there is no personhood to speak of, and
-   * a 404 reads as "personhood not configured" rather than "verified and refused".
+   * `challenge` mints a fresh blind token; `redeem` turns a ring-VRF proof plus that challenge into
+   * a JWT valid for `token_ttl_s`, proving the caller is currently in the People ring this
+   * deployment serves. In `insecure_dev` these routes do not exist: there is no personhood to speak
+   * of, and a 404 reads as "personhood not configured" rather than "verified and refused".
    */
   if (personhood) {
     app.post('/api/v1/auth/challenge', async (_request, reply) =>

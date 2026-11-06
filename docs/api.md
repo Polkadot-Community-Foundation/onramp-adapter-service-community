@@ -3,7 +3,7 @@
 Every route, its request and response shape, and the errors it returns.
 See [README.md](../README.md) for what the service is and how to run it.
 
-Twelve routes are authenticated by the short-lived JWT the handshake mints: `GET /assets`,
+Twelve routes are authenticated by the JWT the handshake mints: `GET /assets`,
 `POST /quote`, `POST /session`, `GET /supported`, `GET /supported/countries`,
 `GET /supported/corridors`, `GET /supported/offramp`, `GET /supported/offramp/corridors`,
 `GET /funding`, `GET /funding/:id`, `POST /funding/:id/cancel` and `GET /transaction/:id`. The
@@ -12,11 +12,11 @@ unauthenticated remainder is `GET /health`, `GET /meld/return` and the two hands
 | Endpoint | Proxies | Purpose |
 | --- | --- | --- |
 | `POST /api/v1/auth/challenge` | none | Mints a fresh 56-byte blind challenge. No auth, rate-limited. |
-| `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a short-lived JWT. Verifies against the People-chain commitment. |
+| `POST /api/v1/auth/redeem` | none | Exchanges a challenge + ring-VRF proof for a JWT valid for `token_ttl_s`. Verifies against the People-chain commitment. |
 | `GET /assets` | none | What Meld currently calls each asset this deployment serves, from the `assets` config: `{assets: [{asset, code, chain, deliverable}]}`. Clients send these codes rather than keeping their own copy. See "`GET /assets`" below. |
 | `GET /supported/countries` | `GET /network-partner/supported/countries` | The region dropdown: every country Meld on-ramps (or off-ramps, on `direction: "sell"`), name-sorted. Read **unkeyed**, so it is deliberately wider than what this account can deliver; whether a country actually routes is answered per selection by `GET /supported`. |
 | `GET /supported` | `GET /network-partner/supported/routes/...` | The payment methods and fiat min/max for one `(country, destination)`, with the country's default fiat resolved first. Empty `methods` means the corridor is not served here. The provider roster is dropped on the way out, because this service never names a provider. |
-| `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Stale rows (not refreshed within three routes passes) and a cold cache return `[]`, which the client falls back from. DOT-scoped in v1. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
+| `GET /supported/corridors` | none (reads a background cache) | Every deliverable corridor for one `(destinationCurrencyCode, direction)` in one payload: `{corridors: [{country, name, fiat, methods}]}`. Served from the `supported_corridors` table a background job refreshes from Meld, so the read is off Meld and off any per-country fan-out. Rows not refreshed within three routes passes are retired, but when none is fresh (a boot after a long idle, or a refresh that keeps failing) the last catalog written is served instead, windowed back from its newest row so an already-retired country stays retired, for up to a day past the freshness window. After that, and for a crypto the refresh has never written, it returns `[]`, which the client falls back from. Buy rows exist for every deliverable asset the config names (`dot@assethub`, `usdt@assethub`, `usdc@assethub`); sell rows for DOT and each offramp lane. **A browse surface, not a charge gate:** its `methods` bounds can be up to three refresh passes old, so re-read `GET /supported` for the selected country before validating an amount. Meld's caching guide says the same about the `supported/routes` data underneath it, and the charge gate reads that endpoint live rather than this table. |
 | `GET /supported/offramp/corridors` | none (reads a background cache) | Sell corridors merged across the configured offramp lanes: `{corridors: [{country, name, fiat, methods: [{paymentMethodType, category, min, max, currency, lanes: [{asset, code, chain, min, max, currency}]}]}]}`. No query parameters (strict). See "Offramp lanes" below. |
 | `GET /supported/offramp?country=XX` | none | One country's sell methods merged across the offramp lanes, read live: `{country, fiat, methods: [...]}`. Empty `methods` means nothing routes. Only `country` is accepted (strict). |
 | `POST /quote` | `POST /payments/crypto/quote` | Offers with the full fee breakdown. |
@@ -41,6 +41,40 @@ quirk this service absorbs; a caller only ever sees `?direction=sell` on the que
 country's default fiat is resolved differently for a sell too, because Meld has no `defaults`
 endpoint for `CRYPTO_OFFRAMP` (it answers `404` for every country); the substitute is documented at
 "Off-ramp corridor discovery" below.
+
+### Provider availability
+
+Meld lists a provider once it is enabled on the account, whether or not it can price a request.
+So this service probes each provider with quotes pinned to it (`health.*` in
+[configuration](configuration.md)) and applies the result to every method `GET /supported`,
+`GET /supported/corridors`, `GET /supported/offramp` and `GET /supported/offramp/corridors`
+return:
+
+- `availability` is `"available"` or `"temporarily_unavailable"`, on every method and on every
+  off-ramp lane.
+- An available method's `min` and `max` span only the providers currently answering. With Banxa
+  down and Transak up, a US card method reads `5` to `3000` USD rather than `5` to `15000`.
+- A method none of whose providers answers is `"temporarily_unavailable"` and keeps its last
+  bound. It is not offered right now, which differs from a method that is absent because no
+  provider serves it at all.
+- An off-ramp method is available when one of its lanes is, and its bound spans the available
+  lanes.
+- Health is kept per provider, direction and method category (`card`, `bank`, `wallet`,
+  `other`). A provider down for card buys still serves bank buys and every sell.
+- A provider can be down in one country only. When a live `POST /quote` lacks an offer from a
+  provider the corridor lists, and the amount is within that provider's limits, the probes check
+  that provider for that direction and method category everywhere and then in that country.
+
+A probe proves that a provider prices a request, not that its widget, KYC or settlement works.
+Each stored result expires after three times the time between two probes of its provider,
+direction and category, and a pause after Meld throttles a probe pushes every expiry back by the
+pause. When probes stop reaching a conclusion, a down provider counts as available again once its
+result expires. `POST /session` checks the amount against the same narrowed bound, except that
+the `serviceProvider` it names always counts: that provider comes from the live offers of
+`POST /quote`, which does not filter by availability, and a live offer outranks a probe. With
+Banxa down, a 10000 USD card session naming Banxa is checked against `5` to `15000`, and one naming
+Transak against `5` to `3000`. When every provider is down the full bound applies, so availability
+never refuses a session on its own.
 
 ## Bounds a caller will meet
 
@@ -82,7 +116,7 @@ reinterpreted:
 | --- | --- | --- |
 | amount field | `sourceAmount`, the fiat charged | `cryptoAmount`, the crypto sold |
 | format | decimal, at most **2** fraction digits | exact decimal, kept as a string end to end and never rounded or parsed; **this service accepts** up to 30 fraction digits (see the note below on what the provider has been observed to accept) |
-| `walletAddress` | **required** on `/session` | **refused**: the provider issues the deposit address after the session exists |
+| `walletAddress` | **required** on `/session`: where the crypto is delivered | the seller's **own** address, the one the crypto is sent from and the provider refunds to, never a destination (the provider issues the deposit address after the session exists). Optional, but Banxa refuses a sell without it; normalised on an Asset Hub lane (`DOT`, `USDT_DOT`, `USDC_DOT`) and checked in that chain's form elsewhere. A malformed one is `400 INVALID_ADDRESS` |
 
 **What "30 fraction digits" is and is not a promise about.** 30 is this service's own accepted
 bound, chosen to be wider than any asset's precision so that nothing is ever silently truncated on
@@ -107,9 +141,9 @@ deliberate, and it is the safe direction to fail — the alternative is parsing 
 one number and handing back a settlement surface committed to the other one. Send the same
 bytes on a retry that you sent the first time.
 
-The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount` or
-`walletAddress`, a buy carrying `cryptoAmount`, or either direction missing its own amount, is a
-local `400 MALFORMED_REQUEST` before any upstream call.
+The wrong combination is **refused, not ignored**: a sell carrying `sourceAmount`, a buy carrying
+`cryptoAmount`, or either direction missing its own amount, is a local `400 MALFORMED_REQUEST`
+before any upstream call.
 
 **The Meld rail serves a sell.** Chainflip still refuses one with
 `400 Other{ DIRECTION_UNSUPPORTED }`, permanently: it has no fiat leg to pay a seller from, and no
@@ -407,6 +441,12 @@ on `sessionData`, not per-field `*Locked` booleans, which are silently ignored. 
 sent locked: `cryptoCurrency`, `destinationCurrencyCode`, `walletAddress`, `sourceAmount`,
 `sourceCurrencyCode`, `paymentMethodType`.
 
+**The caller's address is passed on** as `sessionData.clientIpAddress`, buy and sell. Meld asks for
+the end user's public address on every session, and some providers refuse one without it: Transak
+answers `CLIENT_IP_ADDRESS_REQUIRED`. Only a public address is sent; a private, loopback or
+link-local one (an untrusted ingress hop, or local development) is left out. It is the forwarded
+client only when `server.trusted_proxy_cidrs` trusts the hop in front.
+
 **`country` is echoed, not locked.** Meld exposes no `lockFields` entry for it, so a buyer who
 changes jurisdiction inside Meld's flow is not stopped here. `pinned` records what was committed,
 not necessarily what the buyer transacted under. See threat model R11.
@@ -437,8 +477,9 @@ guarantee about what the provider's widget will allow.
 }
 ```
 
-A sell sends the same body with `direction: "sell"`, `cryptoAmount` in place of `sourceAmount`,
-and no `walletAddress`:
+A sell sends the same body with `direction: "sell"` and `cryptoAmount` in place of
+`sourceAmount`. Its `walletAddress` is the seller's own, sent to Meld as `sessionData.walletAddress`
+(Banxa refuses a sell without it, `CRYPTO_INVALID_DESTINATION_WALLET`):
 
 ```json
 {
@@ -448,6 +489,7 @@ and no `walletAddress`:
   "fiat": "GBP",
   "destinationCurrencyCode": "DOT",
   "cryptoAmount": "12.3456789012",
+  "walletAddress": "15oF4uVJwmo4TdGW7VfQxNLavjCXviqxT9S1MgbjMNHr6Sp5",
   "paymentMethodType": "PAYOUT_TO_BANK",
   "serviceProvider": "TRANSAK"
 }
@@ -488,11 +530,10 @@ Rejected as `REDIRECT_NOT_ALLOWED`, locally.
 }
 ```
 
-On a sell, `pinned` carries `cryptoAmount` and no `walletAddress` or `sourceAmount`: those are
-terms a sell does not commit, and they are absent rather than empty. **`cryptoAmount` is the term
-a resuming client compares against.** On a buy the wallet address distinguishes two purchases in
-one corridor; a sell has none, so this is the only thing between two sales of the same asset in
-the same corridor, and a mismatch must be treated as "this is a different sale", not a warning.
+On a sell, `pinned` carries `cryptoAmount`, the seller's `walletAddress` when one was sent, and no
+`sourceAmount`. **`cryptoAmount` is the term a resuming client compares against.** One seller's
+address is the same across their sales, so it does not tell two sales in one corridor apart; the
+amount does, and a mismatch must be treated as "this is a different sale", not a warning.
 
 `serviceProviderWidgetUrl` is the provider's capture page, always present. `widgetUrl` is Meld's
 own hosted widget for the session, present only when Meld returns one; a product embedding Meld's
@@ -524,7 +565,7 @@ so a proof recorded against an earlier challenge cannot be replayed.
 { "challenge": "<base64url, 56 bytes>" }
 ```
 
-`redeem` exchanges that challenge plus a ring-VRF proof for a short-lived HS256 JWT:
+`redeem` exchanges that challenge plus a ring-VRF proof for an HS256 JWT:
 
 ```json
 {
@@ -534,6 +575,9 @@ so a proof recorded against an earlier challenge cannot be replayed.
   "productId": "another-product.example"
 }
 ```
+
+The proof is the one `host_account_create_proof` returns for the product context
+`[productId, 0]` with the 56 raw challenge bytes as the message, not their base64url text.
 
 A stale or inauthentic challenge is rejected first. Then the ring's current `Root` commitment is
 read off the People chain (`people_rpc_url`) and the proof verified against it here, never on a
@@ -601,7 +645,8 @@ for another caller's alike.
 }
 ```
 
-`direction` is always present. On a sell row, `walletAddress` and `sourceAmount` are absent and
+`direction` is always present. On a sell row, `walletAddress` is the seller's own (absent when none
+was sent), `sourceAmount` is absent, and
 `cryptoAmount` carries the committed crypto at full precision; see `direction` above for why that
 echo is load-bearing rather than informational. A sell moves through the **same** eight states a
 buy does: the direction is a term of the request, not a stage of its life.
@@ -714,6 +759,7 @@ deliberate exception: a `BelowMinimum` / `AboveMaximum` refusal carries the effe
 | 401 | `Other{ UNAUTHORIZED }` | Caller not verified. |
 | 400 | `RouteWithdrawn` | The operator has disabled session creation. |
 | 400 | `Other{ UNKNOWN_RAIL }` | A rail this build knows but this deployment has not wired. |
+| 400 | `Other{ AMOUNT_REJECTED }` | A provider turned the amount down without naming a bound (Meld's `INVALID_AMOUNT`). Not retryable as sent; the remedy is a different amount. Unlike `BelowMinimum`/`AboveMaximum`, there is no `value` to show. |
 | 400 | `Other{ PROVIDER_REJECTED }` | Meld understood the request and declined it, for a reason not enumerated above. Not retryable. |
 | 400 | `Other{ DIRECTION_UNSUPPORTED }` | The named rail does not serve that direction. `chainflip` refuses `direction: "sell"` permanently, having no fiat leg to pay a seller from; `meld` serves both. Not retryable; the remedy is a different rail or a different direction, never the same request again. |
 | 400 | `Other{ RAIL_REFUSED }` | The Chainflip rail refuses **session creation**: it swaps on-chain assets and has no fiat leg. Not retryable. (Its quote leg answers `422 NoQuotesAvailable`.) |

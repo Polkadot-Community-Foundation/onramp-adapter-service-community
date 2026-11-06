@@ -63,7 +63,7 @@ data:
           */}}
           "collections": {{ .Values.auth.personhood.collections | toJson }},
           "challenge_ttl_ms": {{ int (.Values.auth.personhood.challenge_ttl_ms | default 60000) }},
-          "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 300) }}
+          "token_ttl_s": {{ int (.Values.auth.personhood.token_ttl_s | default 86400) }}
         }
       },
       "assets": {{ toJson .Values.assets }},
@@ -96,5 +96,11 @@ data:
         "routes_interval_ms": {{ int .Values.supported.routes_interval_ms }},
         "sell_routes_interval_ms": {{ int .Values.supported.sell_routes_interval_ms }},
         "offramp_lanes": {{ .Values.supported.offramp_lanes | toJson }}
+      },
+      "health": {
+        "enabled": {{ .Values.health.enabled }},
+        "interval_ms": {{ int .Values.health.interval_ms }},
+        "max_probes_per_hour": {{ int .Values.health.max_probes_per_hour }},
+        "sell_amounts": {{ .Values.health.sell_amounts | toJson }}
       }
     }

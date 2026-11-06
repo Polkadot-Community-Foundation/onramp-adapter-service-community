@@ -2,8 +2,9 @@
 
 import { setTimeout as sleep } from 'node:timers/promises';
 
+import { isAbort, message, serial, stopWithin, type Serial } from '../background.js';
 import type { Discovery } from '../meld/discovery.js';
-import { toCorridorDto } from '../meld/discovery.js';
+import { providersOf, toCorridorDto } from '../meld/discovery.js';
 import type { FundingStore } from '../funding/store.js';
 import type { Direction } from '../rail.js';
 
@@ -40,11 +41,13 @@ export interface RefreshIntervals {
   routesMs: number;
   /** Routes for sell jobs. */
   sellRoutesMs?: number;
+  /** The first retry of a job whose routes pass wrote nothing; doubles per retry. */
+  retryBaseMs?: number;
 }
 
-const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
-const isAbort = (error: unknown): boolean => error instanceof Error && error.name === 'AbortError';
+/** A job that wrote nothing is retried this soon, then twice as long each time, until the wait
+ *  reaches the job's own interval and the regular pass is the retry. */
+const DEFAULT_RETRY_BASE_MS = 60_000;
 
 /**
  * Which countries exist, and what fiat each uses.
@@ -135,7 +138,15 @@ export async function refreshRoutes(
       if (methods.length === 0) continue;
       // Abort may have arrived during the probe; do not write once shutdown has begun.
       if (stopped()) break;
-      await store.upsertCorridor({ destination_currency_code: crypto, direction, country, name, fiat: corridor.fiat, methods });
+      await store.upsertCorridor({
+        destination_currency_code: crypto,
+        direction,
+        country,
+        name,
+        fiat: corridor.fiat,
+        methods,
+        method_providers: providersOf(corridor),
+      });
       written += 1;
     } catch (error) {
       log(`supported refresh skipped ${direction} ${country}/${crypto}: ${message(error)}`);
@@ -158,6 +169,7 @@ export function startSupportedRefresh(
   jobs: readonly RefreshJob[],
   intervals: RefreshIntervals,
   log: (message: string) => void,
+  exclusive: Serial = serial(),
 ): { stop: (graceMs?: number) => Promise<void> } {
   const controller = new AbortController();
   const { signal } = controller;
@@ -177,23 +189,65 @@ export function startSupportedRefresh(
     }
   };
 
+  // One job's routes, returning how many corridors it wrote.
+  const routesJob = async (job: RefreshJob): Promise<number> => {
+    let catalog = catalogs.get(jobKey(job));
+    // The boot catalog pass failed. Rebuild here rather than waiting out `catalogMs`, which
+    // would leave the endpoint empty for a day over a blip during a deploy.
+    if (catalog === undefined) {
+      catalog = await refreshCatalog(discovery, job, log, signal, []);
+      if (catalog !== undefined) catalogs.set(jobKey(job), catalog);
+    }
+    if (catalog === undefined) {
+      log(`supported refresh has no catalog for ${job.direction} ${job.crypto} yet; skipping its routes pass`);
+      return 0;
+    }
+    return refreshRoutes(discovery, store, job, catalog, log, signal);
+  };
+
+  // A job that wrote nothing waits its whole interval otherwise (2h buy, 12h sell by default),
+  // which on a crypto with no rows yet is that long serving none. So it is retried on its own,
+  // backing off from `retryBaseMs` and through the same lock as every pass. Discovery caches a
+  // real answer, an empty one included, and never a failed call, so a retry goes back to Meld only
+  // for what failed; once the wait reaches the job's interval the regular pass is the retry.
+  const retryBase = intervals.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
+  const jobInterval = (job: RefreshJob): number =>
+    job.direction === 'sell' ? (intervals.sellRoutesMs ?? intervals.routesMs) : intervals.routesMs;
+  const backoff = new Map<string, number>();
+  const pendingRetry = new Set<string>();
+  const retries = new Set<Promise<void>>();
+  const settle = (job: RefreshJob, written: number): void => {
+    const key = jobKey(job);
+    if (written > 0) {
+      backoff.delete(key);
+      return;
+    }
+    const previous = backoff.get(key);
+    const delay = previous === undefined ? retryBase : previous * 2;
+    backoff.set(key, delay);
+    if (delay >= jobInterval(job) || pendingRetry.has(key) || signal.aborted) return;
+    pendingRetry.add(key);
+    log(`supported refresh wrote no ${job.direction} ${job.crypto} corridors; retrying in ${String(delay)}ms`);
+    const retry = guarded(async () => {
+      try {
+        await sleep(delay, undefined, { signal, ref: false });
+      } finally {
+        pendingRetry.delete(key);
+      }
+      await exclusive(async () => {
+        if (!signal.aborted) settle(job, await routesJob(job));
+      });
+    });
+    retries.add(retry);
+    void retry.finally(() => retries.delete(retry));
+  };
+
   // `only` narrows a pass to one direction so buy and sell can run on their own cadences.
   const routesPass = async (only?: Direction): Promise<void> => {
     for (const job of jobs) {
       if (signal.aborted) break;
       if (only !== undefined && job.direction !== only) continue;
-      let catalog = catalogs.get(jobKey(job));
-      // The boot catalog pass failed. Rebuild here rather than waiting out `catalogMs`, which
-      // would leave the endpoint empty for a day over a blip during a deploy.
-      if (catalog === undefined) {
-        catalog = await refreshCatalog(discovery, job, log, signal, []);
-        if (catalog !== undefined) catalogs.set(jobKey(job), catalog);
-      }
-      if (catalog === undefined) {
-        log(`supported refresh has no catalog for ${job.direction} ${job.crypto} yet; skipping its routes pass`);
-        continue;
-      }
-      await refreshRoutes(discovery, store, job, catalog, log, signal);
+      settle(job, await routesJob(job));
     }
   };
 
@@ -205,17 +259,6 @@ export function startSupportedRefresh(
     } catch (error) {
       if (!isAbort(error)) log(`supported refresh loop stopped: ${message(error)}`);
     }
-  };
-
-  // One pass runs at a time across both loops, so a catalog and a routes pass never hit Meld together.
-  let chain: Promise<void> = Promise.resolve();
-  const exclusive = (pass: () => Promise<void>): Promise<void> => {
-    const next = chain.then(pass, pass);
-    chain = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
   };
 
   const every = (ms: number, pass: () => Promise<void>): Promise<void> =>
@@ -248,20 +291,8 @@ export function startSupportedRefresh(
   })();
 
   return {
-    stop: async (graceMs = 5_000) => {
-      // Halt at the next country boundary so no upsert races the pool close; grace bounds a hung call.
-      controller.abort();
-      if (graceMs <= 0) return;
-      const grace = new AbortController();
-      try {
-        await Promise.race([
-          loop,
-          // `.catch` because aborting the grace timer below rejects it after the race settled.
-          sleep(graceMs, undefined, { signal: grace.signal, ref: false }).catch(() => undefined),
-        ]);
-      } finally {
-        grace.abort();
-      }
-    },
+    // Halt at the next country boundary so no upsert races the pool close; grace bounds a hung call.
+    // A retry mid-pass is a pass too: it halts at the same boundary.
+    stop: (graceMs = 5_000) => stopWithin(controller, () => Promise.all([loop, ...retries]), graceMs),
   };
 }

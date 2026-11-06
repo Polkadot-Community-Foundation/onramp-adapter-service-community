@@ -12,13 +12,15 @@ import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 
 import { hkdfSync } from 'node:crypto';
 
+import { serial } from './background.js';
 import { loadConfig, type Config } from './config.js';
 import { ChainflipRail } from './chainflip/rail.js';
 import { FundingStore } from './funding/store.js';
 import { startWorker, type RailObservation } from './funding/worker.js';
 import { startSupportedRefresh, type RefreshJob } from './supported/refresh.js';
+import { pinnedQuote, startProviderProbes } from './health/probe.js';
 import { MeldClient, MeldHttpError } from './meld/client.js';
-import { AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
+import { ASSET_IDS, ASSETS, AssetCatalog, installCatalog, type AssetId } from './meld/catalog.js';
 import { MeldDiscovery } from './meld/discovery.js';
 import { Onramp } from './onramp.js';
 import { MeldRail } from './meld/rail.js';
@@ -30,21 +32,24 @@ import { validateWithCommitment } from './personhood/verifiablejs.js';
 import { resolveSecret } from './secret.js';
 import { buildServer } from './server.js';
 
-// The assets the supported-corridors refresh enumerates; DOT only in v1, the table is crypto-keyed so more are additive.
-const SUPPORTED_REFRESH_ASSETS: readonly AssetId[] = ['dot@assethub'];
+// The asset the refresh walks in both directions; the table is crypto-keyed so more are additive.
+const SUPPORTED_REFRESH_ASSET: AssetId = 'dot@assethub';
 
 /**
- * Every job the refresh walks: both directions for each refreshed asset this deployment names
- * (under its configured code), plus a sell job per offramp lane. A job that finds no provider
- * writes nothing, which is not a failure.
+ * Every job the refresh walks: both directions for DOT, a buy job for every other deliverable
+ * asset this deployment names (a client reads the buy catalog for whichever one its route
+ * delivers, so an unrefreshed one reads as no corridors at all), plus a sell job per offramp lane.
+ * Each under its configured code. A job that finds no provider writes nothing, which is not a failure.
  */
 export function refreshJobs(
   lanes: readonly { code: string }[],
   assets: Readonly<Partial<Record<AssetId, string>>>,
 ): RefreshJob[] {
-  const jobs: RefreshJob[] = SUPPORTED_REFRESH_ASSETS.flatMap((asset) => {
+  const jobs: RefreshJob[] = ASSET_IDS.flatMap((asset): RefreshJob[] => {
     const crypto = assets[asset];
-    return crypto === undefined ? [] : DIRECTIONS.map((direction) => ({ crypto, direction }));
+    if (crypto === undefined || !ASSETS[asset].deliverable) return [];
+    if (asset === SUPPORTED_REFRESH_ASSET) return DIRECTIONS.map((direction) => ({ crypto, direction }));
+    return [{ crypto, direction: 'buy' }];
   });
   for (const { code } of lanes) {
     if (!jobs.some((j) => j.crypto === code && j.direction === 'sell')) {
@@ -151,6 +156,9 @@ export async function start(
   let app: Awaited<ReturnType<typeof buildServer>> | undefined;
   let worker: ReturnType<typeof startWorker> | undefined;
   let supported: ReturnType<typeof startSupportedRefresh> | undefined;
+  let probes: ReturnType<typeof startProviderProbes> | undefined;
+  // The probes read the corridors the supported refresh stores, so they run only beside it.
+  const probing = cfg.supported.enabled && cfg.health.enabled;
   // The worker starts only after this and after the port opens. Constructed earlier, a boot that
   // then failed on a bad credential would leave a loop advancing durable funding rows with no
   // handle to stop it, because `start` rejects and the caller never gets a `close`.
@@ -164,7 +172,21 @@ export async function start(
     app = await buildServer(
       cfg,
       (audit) =>
-        new Onramp(cfg, rails, audit, funding, meldRail, Date.now, () => crypto.randomUUID(), discovery),
+        new Onramp(
+          cfg,
+          rails,
+          audit,
+          funding,
+          meldRail,
+          Date.now,
+          () => crypto.randomUUID(),
+          discovery,
+          probing
+            ? (keys) => {
+                probes?.suspect(keys);
+              }
+            : undefined,
+        ),
       personhood,
       logDestination,
     );
@@ -258,11 +280,14 @@ export async function start(
       : undefined;
 
     // The supported-corridors refresh, started last like the worker so a failed boot leaves no unstoppable loop.
+    // The provider probes read its corridors and share its lock, so the two never call Meld at once.
+    const jobs = refreshJobs(cfg.supported.offramp_lanes, cfg.assets);
+    const exclusive = serial();
     supported = cfg.supported.enabled
       ? startSupportedRefresh(
           discovery,
           funding,
-          refreshJobs(cfg.supported.offramp_lanes, cfg.assets),
+          jobs,
           {
             catalogMs: cfg.supported.catalog_interval_ms,
             routesMs: cfg.supported.routes_interval_ms,
@@ -272,8 +297,35 @@ export async function start(
           (message) => {
             server.log.warn(message);
           },
+          exclusive,
         )
       : undefined;
+    probes =
+      probing
+        ? startProviderProbes(
+            {
+              store: funding,
+              quote: pinnedQuote(meld),
+              jobs,
+              log: {
+                info: (message) => {
+                  server.log.info(message);
+                },
+                warn: (message) => {
+                  server.log.warn(message);
+                },
+              },
+            },
+            {
+              intervalMs: cfg.health.interval_ms,
+              failuresToDown: cfg.health.failures_to_down,
+              throttlePauseMs: cfg.health.throttle_pause_ms,
+              maxProbesPerHour: cfg.health.max_probes_per_hour,
+              sellAmounts: new Map(cfg.health.sell_amounts.map(({ code, amount }) => [code, amount])),
+            },
+            exclusive,
+          )
+        : undefined;
   } catch (error) {
     // One guard, spanning everything between the store opening and the handle being returned.
     //
@@ -287,6 +339,7 @@ export async function start(
     // Stop the loops too: they are the last things started so this is defensive today, but it keeps
     // the cleanup complete if a throwing step is ever added after them.
     await worker?.stop();
+    await probes?.stop();
     await supported?.stop();
     await app?.close();
     await funding.close();
@@ -302,6 +355,7 @@ export async function start(
       // one stopped. Draining the pool also returns its CloudSQL connections promptly instead of
       // leaving the server to time them out.
       await worker?.stop();
+      await probes?.stop();
       await supported?.stop();
       await app.close();
       await funding.close();

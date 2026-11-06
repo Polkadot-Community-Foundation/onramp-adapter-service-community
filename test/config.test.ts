@@ -57,7 +57,7 @@ describe('parseConfig', () => {
     ['supported.routes_interval_ms', ['supported', 'routes_interval_ms'], 59_999, 86_400_001],
     ['supported.sell_routes_interval_ms', ['supported', 'sell_routes_interval_ms'], 59_999, 7 * 86_400_000 + 1],
     ['auth.personhood.challenge_ttl_ms', ['auth', 'personhood', 'challenge_ttl_ms'], 999, 300_001],
-    ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 3_601],
+    ['auth.personhood.token_ttl_s', ['auth', 'personhood', 'token_ttl_s'], 29, 86_401],
   ])('bounds %s at both ends', (_label, path, tooLow, tooHigh) => {
     for (const value of [tooLow, tooHigh]) {
       if (value === undefined) continue;
@@ -951,6 +951,47 @@ describe('parseConfig', () => {
       expect(lanes([{ asset: 'usdt@solana', extra: 1 }])).toThrow();
       // The old shape: the chain now comes from the asset and the code from `assets`.
       expect(lanes([{ code: 'USDT_SOLANA', chain: 'solana' }])).toThrow();
+    });
+  });
+
+  describe('health', () => {
+    const health = (value: unknown) => () => parseConfig(rawConfig({ health: value }));
+
+    it('probes every ten minutes by default, with no sell amounts', () => {
+      expect(parseConfig(rawConfig()).health).toEqual({
+        enabled: true,
+        interval_ms: 600_000,
+        failures_to_down: 2,
+        throttle_pause_ms: 900_000,
+        max_probes_per_hour: 120,
+        sell_amounts: [],
+      });
+    });
+
+    it('resolves each sell amount\'s asset to its Meld code', () => {
+      expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '15' }] })().health.sell_amounts).toEqual([
+        { asset: 'dot@assethub', amount: '15', code: 'DOT' },
+      ]);
+    });
+
+    it('refuses a malformed, zero or duplicated sell amount', () => {
+      expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '1e3' }] })).toThrow(/plain decimal/);
+      expect(health({ sell_amounts: [{ asset: 'dot@assethub', amount: '0.00' }] })).toThrow(/above zero/);
+      expect(
+        health({
+          sell_amounts: [
+            { asset: 'dot@assethub', amount: '15' },
+            { asset: 'dot@assethub', amount: '20' },
+          ],
+        }),
+      ).toThrow(/Duplicate sell amount "dot@assethub"/);
+    });
+
+    it('refuses a sell amount for an asset `assets` does not name', () => {
+      const cfg = rawConfig({ health: { sell_amounts: [{ asset: 'usdc@solana', amount: '50' }] } });
+      const assets = { ...(cfg['assets'] as Record<string, string>) };
+      delete assets['usdc@solana'];
+      expect(() => parseConfig({ ...cfg, assets })).toThrow(/"usdc@solana" has no Meld code/);
     });
   });
 

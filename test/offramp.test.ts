@@ -14,6 +14,7 @@ const m = (paymentMethodType: string, over: Record<string, unknown> = {}) => ({
   min: '1',
   max: '100',
   currency: 'EUR',
+  availability: 'available' as const,
   ...over,
 });
 
@@ -26,7 +27,7 @@ const row = (lane: OfframpLane, country: string, methods: ReturnType<typeof m>[]
   ...over,
 });
 
-const offer = (lane: OfframpLane, min: string, max: string, currency = 'EUR') => ({ ...lane, min, max, currency });
+const offer = (lane: OfframpLane, min: string, max: string, currency = 'EUR') => ({ ...lane, min, max, currency, availability: 'available' });
 
 describe('mergeMethods', () => {
   it('lists every lane per method in lane order, with its own limits, and spans min and max', () => {
@@ -42,6 +43,7 @@ describe('mergeMethods', () => {
         min: '2',
         max: '250',
         currency: 'EUR',
+        availability: 'available',
         lanes: [offer(DOT, '5', '100'), offer(SOL, '9', '250'), offer(ARB, '2', '90')],
       },
       {
@@ -50,6 +52,7 @@ describe('mergeMethods', () => {
         min: '1',
         max: '100',
         currency: 'EUR',
+        availability: 'available',
         lanes: [offer(SOL, '1', '100')],
       },
     ]);
@@ -81,6 +84,16 @@ describe('mergeMethods', () => {
     const [only] = mergeMethods([row(DOT, 'DE', [{ ...m('SEPA'), providers: ['X'] } as never])]);
     expect(only).not.toHaveProperty('providers');
     expect(only?.lanes[0]).toEqual(offer(DOT, '1', '100'));
+  });
+
+  it('bounds a method by its available lanes, and flags it when no lane is available', () => {
+    const down = { availability: 'temporarily_unavailable' as const };
+    const [partly] = mergeMethods([row(DOT, 'DE', [m('SEPA', { min: '2', max: '900', ...down })]), row(SOL, 'DE', [m('SEPA', { min: '9', max: '250' })])]);
+    expect(partly).toMatchObject({ min: '9', max: '250', availability: 'available' });
+    expect(partly?.lanes.map((lane) => lane.availability)).toEqual(['temporarily_unavailable', 'available']);
+
+    const [none] = mergeMethods([row(DOT, 'DE', [m('SEPA', { min: '2', max: '900', ...down })]), row(SOL, 'DE', [m('SEPA', { min: '9', max: '250', ...down })])]);
+    expect(none).toMatchObject({ min: '2', max: '900', availability: 'temporarily_unavailable' });
   });
 
   it('is empty when nothing routes', () => {
@@ -119,11 +132,13 @@ describe('mergeOfframpCorridors', () => {
 });
 
 describe('refreshJobs', () => {
-  it('keeps DOT buy and sell, and adds a sell job per lane without duplicating', () => {
+  it('keeps DOT buy and sell, buys every other deliverable asset, and adds a sell job per lane without duplicating', () => {
     const jobs = refreshJobs([{ code: 'DOT' }, { code: 'USDT_SOLANA' }, { code: 'USDT_SOLANA' }], TEST_ASSETS);
     expect(jobs).toEqual([
       { crypto: 'DOT', direction: 'buy' },
       { crypto: 'DOT', direction: 'sell' },
+      { crypto: 'USDT_DOT', direction: 'buy' },
+      { crypto: 'USDC_DOT', direction: 'buy' },
       { crypto: 'USDT_SOLANA', direction: 'sell' },
     ]);
   });
@@ -132,7 +147,16 @@ describe('refreshJobs', () => {
     expect(refreshJobs([{ code: 'USDT_SOLANA' }], TEST_ASSETS).map((j) => `${j.crypto}|${j.direction}`)).toEqual([
       'DOT|buy',
       'DOT|sell',
+      'USDT_DOT|buy',
+      'USDC_DOT|buy',
       'USDT_SOLANA|sell',
+    ]);
+  });
+
+  it('adds a sell job for a deliverable asset only when it is a lane', () => {
+    expect(refreshJobs([{ code: 'USDT_DOT' }], { 'usdt@assethub': 'USDT_DOT' })).toEqual([
+      { crypto: 'USDT_DOT', direction: 'buy' },
+      { crypto: 'USDT_DOT', direction: 'sell' },
     ]);
   });
 
