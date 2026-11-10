@@ -316,6 +316,12 @@ const configSchema = z
          */
         mode: z.enum(['personhood', 'insecure_dev']),
         /**
+         * Permits `insecure_dev` with `environment: "production"`, and nothing else. For an internal
+         * test instance whose every caller is the operator; every other production guard still
+         * applies. Refused unless both of those are set, so it cannot linger as a stale assertion.
+         */
+        allow_insecure_dev_in_production: z.boolean().default(false),
+        /**
          * Personhood's configuration. Optional as a shape and required by the superRefine when
          * `mode` is `personhood`: a mode with no key/RPC/collection must fail at boot, never
          * serve with a verifier it cannot run. Nothing here has a default.
@@ -852,11 +858,25 @@ const configSchema = z
       });
     }
 
-    if (cfg.auth.mode === 'insecure_dev' && cfg.environment !== 'development') {
+    const insecureDevOptIn = cfg.auth.allow_insecure_dev_in_production;
+    if (
+      cfg.auth.mode === 'insecure_dev' &&
+      cfg.environment !== 'development' &&
+      !(insecureDevOptIn && cfg.environment === 'production')
+    ) {
       ctx.addIssue({
         code: 'custom',
         path: ['auth', 'mode'],
         message: `auth.mode "insecure_dev" is refused when environment is "${cfg.environment}"; it has no data separation between callers.`,
+      });
+    }
+    if (insecureDevOptIn && (cfg.auth.mode !== 'insecure_dev' || cfg.environment !== 'production')) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['auth', 'allow_insecure_dev_in_production'],
+        message:
+          'auth.allow_insecure_dev_in_production applies only to auth.mode "insecure_dev" with environment ' +
+          `"production", not mode "${cfg.auth.mode}" in "${cfg.environment}". Remove it.`,
       });
     }
 

@@ -387,6 +387,39 @@ afterEach(async () => {
     expect(logged).toContain('"environment":"sandbox"');
   }, 20_000);
 
+  it('warns loudly when insecure_dev is opted into production', async () => {
+    // Production pins api.meld.io, so `fetch` is stubbed: the boot probe is answered 401 locally
+    // and nothing reaches the real endpoint with a fake key.
+    const fetchStub = vi.fn((_input: URL | string) =>
+      Promise.resolve(new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })),
+    );
+    vi.stubGlobal('fetch', fetchStub);
+    try {
+      const path = await writeConfig('prod-opt-in', 'https://api.meld.io');
+      const written = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+      const pgPath = join(dir, 'prod-opt-in-pg.key');
+      await writeFile(pgPath, `${storePassword()}\n`);
+      const raw = {
+        ...written,
+        environment: 'production',
+        auth: { mode: 'insecure_dev', allow_insecure_dev_in_production: true },
+        store: { ...(written.store as Record<string, unknown>), host: '127.0.0.1', ssl: false, password: { mode: 'file', path: pgPath } },
+      };
+      await writeFile(path, JSON.stringify(raw));
+      const lines: string[] = [];
+
+      await expect(start(path, { write: (line) => lines.push(line) })).rejects.toBeInstanceOf(MeldHttpError);
+
+      expect(String(fetchStub.mock.calls[0]?.[0])).toMatch(/^https:\/\/api\.meld\.io\//);
+      const logged = lines.join('');
+      expect(logged).toContain('auth.allow_insecure_dev_in_production is ON');
+      expect(logged).toContain('"environment":"production"');
+      expect(logged).toContain('"meld_base_url":"https://api.meld.io"');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }, 20_000);
+
   it('stays quiet about the origin allowlist when it is populated', async () => {
     // The other half: a warning that always fires is a warning nobody reads.
     const baseUrl = await fakeMeld({ quotes: [] });

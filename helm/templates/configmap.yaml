@@ -52,6 +52,7 @@ data:
       },
       "auth": {
         "mode": {{ .Values.auth.mode | quote }},
+        "allow_insecure_dev_in_production": {{ .Values.auth.allow_insecure_dev_in_production }},
         "personhood": {
           "jwt_key": { "mode": "file", "path": {{ printf "%s/%s" (.Values.secretMountPath | default "/run/secrets") .Values.secrets.jwtKey.key | quote }} },
           "people_rpc_url": {{ .Values.auth.personhood.people_rpc_url | quote }},
