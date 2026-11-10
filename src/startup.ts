@@ -223,6 +223,15 @@ export async function start(
     );
   }
 
+  if (cfg.auth.allow_insecure_dev_in_production) {
+    app.log.warn(
+      { environment: cfg.environment, meld_base_url: cfg.meld.base_url },
+      'auth.allow_insecure_dev_in_production is ON: the PRODUCTION Meld key is spent for any caller ' +
+        'that names an allowed product in a header, and all callers share funding rows. Internal ' +
+        'test instances only; remove it before any real buyer can reach this service.',
+    );
+  }
+
   // `buildServer` has already built the caller verifier, so an unimplemented auth mode has
   // already stopped the process by this point. What is left is proving the credential.
   //

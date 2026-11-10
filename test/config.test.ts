@@ -216,6 +216,84 @@ describe('parseConfig', () => {
     ).toThrow(/insecure_dev.*refused when environment is "production"/s);
   });
 
+  describe('auth.allow_insecure_dev_in_production', () => {
+    /** A valid production config in insecure_dev, with the opt-in set as given. */
+    const optedIn = (allow?: boolean, overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      ...productionConfig(),
+      auth: { mode: 'insecure_dev', ...(allow === undefined ? {} : { allow_insecure_dev_in_production: allow }) },
+      ...overrides,
+    });
+
+    it.each([
+      ['omitted', undefined],
+      ['false', false],
+    ])('still refuses insecure_dev in production when the opt-in is %s', (_label, allow) => {
+      expect(() => parseConfig(optedIn(allow))).toThrow(/insecure_dev.*refused when environment is "production"/s);
+    });
+
+    it('defaults to false', () => {
+      expect(parseConfig(personhoodConfig()).auth.allow_insecure_dev_in_production).toBe(false);
+    });
+
+    it('accepts insecure_dev in production against api.meld.io when opted in', () => {
+      const cfg = parseConfig(optedIn(true));
+      expect(cfg.environment).toBe('production');
+      expect(cfg.auth.mode).toBe('insecure_dev');
+      expect(cfg.meld.base_url).toBe('https://api.meld.io');
+      expect(cfg.auth.allow_insecure_dev_in_production).toBe(true);
+    });
+
+    it('still refuses insecure_dev in sandbox when opted in', () => {
+      expect(() =>
+        parseConfig(
+          optedIn(true, {
+            environment: 'sandbox',
+            meld: { ...(productionConfig().meld as Record<string, unknown>), base_url: 'https://api-sb.meld.io' },
+          }),
+        ),
+      ).toThrow(/insecure_dev.*refused when environment is "sandbox"/s);
+    });
+
+    it.each([
+      ['personhood mode', { ...productionConfig(), auth: { ...(personhoodBlock().auth as object), allow_insecure_dev_in_production: true } }],
+      ['development', { ...rawConfig(), auth: { mode: 'insecure_dev', allow_insecure_dev_in_production: true } }],
+    ])('refuses the opt-in as a stale assertion under %s', (_label, raw) => {
+      expect(() => parseConfig(raw)).toThrow(/auth\.allow_insecure_dev_in_production applies only to/);
+    });
+
+    it.each([
+      ['a non-Meld host', { meld: { ...(productionConfig().meld as Record<string, unknown>), base_url: 'https://attacker.example' } }, /meld\.base_url/],
+      ['the sandbox host', { meld: { ...(productionConfig().meld as Record<string, unknown>), base_url: 'https://api-sb.meld.io' } }, /meld\.base_url/],
+      ['an env-var Meld key', { meld: { ...(productionConfig().meld as Record<string, unknown>), api_key: { mode: 'env', var: 'K' } } }, /meld\.api_key must be mounted as a file/],
+      ['an env-var store password', { store: { ...(productionConfig().store as Record<string, unknown>), password: { mode: 'env', var: 'P' } } }, /store\.password must be mounted as a file/],
+      ['a plaintext CORS origin', { cors: { allowed_origins: ['http://app.example'] } }, /must use https outside development/],
+      ['a preview pattern', { cors: { allowed_origins: ['https://pr#-app.example'] } }, /preview-series pattern/],
+      ['a plaintext remote store', { store: { ...(productionConfig().store as Record<string, unknown>), host: '10.1.2.3', ssl: false } }, /store\.ssl/],
+    ])('relaxes no other production guard: still refuses %s', (_label, overrides, message) => {
+      expect(() => parseConfig(optedIn(true, overrides))).toThrow(message);
+    });
+
+    it('still refuses a plaintext People RPC when the unused personhood block is present', () => {
+      const personhood = (personhoodBlock().auth as { personhood: Record<string, unknown> }).personhood;
+      expect(() =>
+        parseConfig({
+          ...productionConfig(),
+          auth: {
+            mode: 'insecure_dev',
+            allow_insecure_dev_in_production: true,
+            personhood: { ...personhood, people_rpc_url: 'ws://people.example' },
+          },
+        }),
+      ).toThrow(/people_rpc_url must use wss/);
+    });
+
+    it('is a boolean, not a truthy string', () => {
+      expect(() =>
+        parseConfig({ ...productionConfig(), auth: { mode: 'insecure_dev', allow_insecure_dev_in_production: 'true' } }),
+      ).toThrow(/allow_insecure_dev_in_production/);
+    });
+  });
+
   it('allows personhood auth in production', () => {
     // A production environment also needs a production endpoint; see the pairing check below,
     // which this test would otherwise trip on the fixture's sandbox URL.

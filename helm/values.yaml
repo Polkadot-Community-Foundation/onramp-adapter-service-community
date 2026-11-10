@@ -78,6 +78,9 @@ meld:
 # The caller gate. personhood is the production posture.
 auth:
   mode: personhood
+  # Permits `insecure_dev` with `environment: production`. Internal test instances only; see
+  # docs/configuration.md.
+  allow_insecure_dev_in_production: false
   personhood:
     # jwt_key and people_rpc_url/collection/ring exponent are set per-env.
     people_rpc_url: ""
