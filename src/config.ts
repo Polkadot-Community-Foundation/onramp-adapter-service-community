@@ -252,6 +252,8 @@ const configSchema = z
          * behind an ingress is one bucket for everyone.
          */
         trusted_proxy_cidrs: z.array(z.string().min(1)).default([]),
+        /** Off keeps the client address out of request and rate-limit log lines. */
+        log_client_address: z.boolean().default(true),
       })
       .strict(),
     meld: z
