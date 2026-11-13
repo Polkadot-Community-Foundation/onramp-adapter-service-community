@@ -217,6 +217,56 @@ describe('logging', () => {
     expect(sink.lines.join('')).not.toContain('super-secret-caller-token');
   });
 
+  describe('client address', () => {
+    const CLIENT = '203.0.113.50';
+
+    const limitedTwice = async (logClientAddress: boolean | undefined) => {
+      const sink = capture();
+      const built = await serve(
+        async () => RESPONSE,
+        config({
+          rate_limit: { per_address_max: 1, window_seconds: 60 },
+          server: {
+            port: 8080,
+            host: '127.0.0.1',
+            log_level: 'info',
+            trusted_proxy_cidrs: ['127.0.0.1/32'],
+            ...(logClientAddress === undefined ? {} : { log_client_address: logClientAddress }),
+          },
+        }),
+        {},
+        sink,
+      );
+      const hit = () =>
+        built.inject({
+          method: 'POST',
+          url: '/quote',
+          headers: { ...DEV_HEADERS, 'x-forwarded-for': CLIENT },
+          payload: quoteRequestBody(),
+        });
+      await hit();
+      expect((await hit()).statusCode).toBe(429);
+      return sink.lines;
+    };
+
+    it('is logged on request and rate-limit lines by default', async () => {
+      const lines = await limitedTwice(undefined);
+
+      expect(lines.some((l) => l.includes(`"remoteAddress":"${CLIENT}"`))).toBe(true);
+      expect(lines.some((l) => l.includes('rate limited') && l.includes(`"ip":"${CLIENT}"`))).toBe(true);
+    });
+
+    it('is left out of every line when log_client_address is off', async () => {
+      const lines = await limitedTwice(false);
+
+      expect(lines.some((l) => l.includes('"url":"/quote"'))).toBe(true);
+      expect(lines.some((l) => l.includes('rate limited'))).toBe(true);
+      expect(lines.join('')).not.toContain(CLIENT);
+      expect(lines.join('')).not.toContain('remoteAddress');
+      expect(lines.join('')).not.toContain('remotePort');
+    });
+  });
+
   it('redacts a Secret written straight to the log, and one carried by an Error', async () => {
     // The disclosure path the docs claim and nothing asserted: the API key reaching a log line.
     // `Secret`'s hooks are unit-tested in isolation against JSON.stringify and util.inspect;
