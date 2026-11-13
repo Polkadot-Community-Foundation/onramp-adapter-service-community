@@ -84,6 +84,13 @@ type OnrampFactory = (audit: AuditLog) => OnrampPort;
  */
 type LogDestination = { write: (line: string) => void };
 
+/** Fastify's default `req` serializer without the client's address and port. */
+const requestWithoutClientAddress = (request: Pick<FastifyRequest, 'method' | 'url' | 'host'>) => ({
+  method: request.method,
+  url: request.url,
+  host: request.host,
+});
+
 export async function buildServer(
   cfg: Config,
   makeOnramp: OnrampFactory,
@@ -101,6 +108,7 @@ export async function buildServer(
       // for redaction to act on. A caller's bearer token stays out because it is never
       // serialised; the API key stays out because `Secret` redacts itself.
       ...(logDestination === undefined ? {} : { stream: logDestination }),
+      ...(cfg.server.log_client_address ? {} : { serializers: { req: requestWithoutClientAddress } }),
     },
     // Trust by peer address, handed to Fastify as the list `proxy-addr` compiles.
     //
@@ -578,7 +586,7 @@ export async function buildServer(
     // Rate limited. Distinct from the generic 4xx below because the remedy is different: wait
     // and retry, rather than change the request. The plugin has already set `retry-after`.
     if (status === 429) {
-      request.log.warn({ ip: request.ip }, 'rate limited');
+      request.log.warn(cfg.server.log_client_address ? { ip: request.ip } : {}, 'rate limited');
       return send(429, {
         tag: 'Other',
         value: { code: 'RATE_LIMITED', message: 'Too many requests. Retry shortly.' },
